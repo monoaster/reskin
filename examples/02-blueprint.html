@@ -1,0 +1,884 @@
+<!doctype html>
+<html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>reskin 02-blueprint</title>
+<style>
+  :root { color-scheme: dark; }
+  html, body { margin: 0; height: 100%; background: #0c0e2b; color: #f1eefb; font: 15px/1.4 ui-monospace, Menlo, monospace; }
+  body { display: grid; place-items: center; }
+  main { width: min(92vmin, 920px); }
+  canvas { display: block; width: 100%; aspect-ratio: 1; border-radius: 18px; background: #000; }
+  p { margin: 10px 2px 0; display: flex; justify-content: space-between; gap: 12px; opacity: .8; }
+  a { color: inherit; }</style>
+<main><canvas id="c" width="1000" height="1000"></canvas>
+<p><span>reskin / 02-blueprint</span><span>prompt: prompts/02-blueprint.md</span></p></main>
+<script>
+const rig = (() => {
+// reskin rig: one character, one scene, one 3.2 second walk. Every style draws from this.
+//
+// World: a 1000 x 1000 square, y points down, the floor is y = 800.
+// The beat is 150 bpm (0.4 s). Footfalls land on the beat, the build passes on beat 7 (t = 2.8).
+//
+//   0.0 - 2.0   walks in from the left, slows to a stop at x = 490
+//   2.0 - 2.4   raises the near hand to the laptop keyboard
+//   2.4 - 2.8   types (three key taps: 2.4, 2.6, 2.8), code rows fill the screen
+//   2.8         the build passes: the screen flips, confetti, a hop
+//   2.8 - 3.2   fist pump, then the clip ends
+//
+// Everything here is a pure function of t. No randomness, no clock: call it with any t, in any order.
+
+const W = 1000;
+const H = 1000;
+const FLOOR = 800;
+const T = 3.2;            // seconds per style
+const BPM = 150;
+const BEAT = 0.4;
+const SHIP_T = 2.8;       // the moment the build passes
+
+const LAYOUT = {
+  floor: FLOOR,
+  desk:   { x: 560, y: 610, w: 400, h: 190 },                 // table top is y = 610
+  laptop: { base: { x: 600, y: 598, w: 230, h: 12 },          // keyboard slab, sits on the desk
+            screen: { x: 615, y: 440, w: 200, h: 158 } },      // facing the viewer
+  hand:   { x: 650, y: 594 },                                  // where the near hand lands on the keys
+  window: { x: 80, y: 130, w: 260, h: 350 },
+  clock:  { x: 430, y: 170, r: 34 },
+  plant:  { x: 880, y: 800 },
+};
+
+const DIMS = {
+  thigh: 100, shin: 98, upperArm: 92, foreArm: 86,
+  torso: 124, neck: 16, headR: 38,
+  thighW: 24, shinW: 19, upperArmW: 17, foreArmW: 15, torsoW: 58, footLen: 40, footH: 14,
+  depth: 26,   // z offset of the near / far limbs, for 3D styles
+};
+
+const SCREEN_LINES = [
+  'const build = await ship()',
+  'if (build.ok) {',
+  '  deploy(build)',
+  '}',
+  'tests: 42 passed',
+  'status: SHIPPED',
+];
+
+const clamp = (v, a = 0, b = 1) => Math.min(b, Math.max(a, v));
+const lerp = (a, b, k) => a + (b - a) * k;
+const smooth = (a, b, v) => { const k = clamp((v - a) / (b - a)); return k * k * (3 - 2 * k); };
+const easeInOut = (k) => k * k * (3 - 2 * k);
+
+// ---- where the body is --------------------------------------------------------------------
+const X0 = -40, X1 = 490, CRUISE_END = 1.5, STOP = 2.0;
+const V = (X1 - X0) / (CRUISE_END + (STOP - CRUISE_END) / 2);   // px per second while cruising
+
+function bodyX(t) {
+  if (t <= CRUISE_END) return X0 + V * Math.max(t, -1);
+  if (t >= STOP) return X1;
+  const u = (t - CRUISE_END) / (STOP - CRUISE_END);               // linear slow-down to a stop
+  return X0 + V * CRUISE_END + V * (STOP - CRUISE_END) * (u - u * u / 2);
+}
+
+// Feet plant in world space on the beat, so nothing slides. Each foot has a 0.8 s cycle:
+// 0 - 0.6 planted, 0.6 - 1 swinging to the next planting spot, which is under the pelvis at mid-stance.
+function footTrack(t, offset, side) {
+  const P = 0.8, STANCE = 0.6;
+  const n = Math.floor((t - offset) / P);
+  const u = (t - offset) / P - n;
+  const land = (k) => bodyX(offset + k * P + 0.24) + side * 6;
+  const L0 = land(n), L1 = land(n + 1);
+  if (u < STANCE) return { x: L0, lift: 0, swing: -1, u };
+  const s = (u - STANCE) / (1 - STANCE);
+  return { x: lerp(L0, L1, easeInOut(s)), lift: Math.sin(Math.PI * s), swing: s, u };
+}
+
+function ik2(ax, ay, tx, ty, l1, l2, sgn) {
+  let dx = tx - ax, dy = ty - ay;
+  let d = Math.hypot(dx, dy);
+  const max = l1 + l2 - 0.5;
+  if (d > max) { tx = ax + dx * max / d; ty = ay + dy * max / d; dx = tx - ax; dy = ty - ay; d = max; }
+  const a = (l1 * l1 - l2 * l2 + d * d) / (2 * d);
+  const h = Math.sqrt(Math.max(0, l1 * l1 - a * a));
+  const mx = ax + a * dx / d, my = ay + a * dy / d;
+  return { x: mx + sgn * h * (-dy / d), y: my + sgn * h * (dx / d), tx, ty };
+}
+
+// ---- the pose -----------------------------------------------------------------------------
+// Returns joints as {x, y, z}. z is -1 (far side), 0 (spine) or +1 (near side) so 3D styles can push limbs apart.
+function pose(t) {
+  t = clamp(t, 0, T);
+  const D = DIMS;
+  const walk = 1 - smooth(1.55, 2.05, t);             // 1 while walking, 0 once stopped
+  const reach = smooth(2.0, 2.45, t);                 // near hand goes to the keyboard
+  const celebrate = smooth(2.82, 3.0, t);             // fist pump
+  const tapPulse = (t0) => { const k = (t - t0) / 0.12; return k > 0 && k < 1 ? Math.sin(Math.PI * k) : 0; };
+  const tap = Math.max(tapPulse(2.4), tapPulse(2.6), tapPulse(2.8));
+  const hopK = clamp((t - 2.84) / 0.34);
+  const hop = 34 * Math.sin(Math.PI * hopK);
+
+  const px = bodyX(t) + 0;
+  const bob = walk * 7 * (0.5 + 0.5 * Math.cos(2 * Math.PI * t / BEAT));
+  const standH = 196;
+  const py = FLOOR - standH + bob - hop;
+  const lean = 0.05 * walk + 0.16 * reach * (1 - celebrate * 0.7) - 0.04 * celebrate;
+
+  const sx = px + Math.sin(lean) * D.torso * 0.96;
+  const sy = py - Math.cos(lean) * D.torso * 0.96;
+  const neck = { x: px + Math.sin(lean) * D.torso, y: py - Math.cos(lean) * D.torso, z: 0 };
+  const headTilt = lean + 0.1 * reach - 0.1 * celebrate;
+  const head = { x: neck.x + Math.sin(headTilt) * (D.neck + D.headR), y: neck.y - Math.cos(headTilt) * (D.neck + D.headR), z: 0, r: D.headR, angle: headTilt };
+
+  // legs
+  const fN = footTrack(t, 0.0, +1);       // near foot lands on t = 0, 0.8, 1.6 ...
+  const fF = footTrack(t, 0.4, -1);       // far foot lands on t = 0.4, 1.2, 2.0 ...
+  const settle = 1 - walk;
+  const stand = (side) => px + side * 16;
+  const legJoints = (f, side, z) => {
+    const fx = lerp(f.x, stand(side) + 0, settle);
+    const lift = f.lift * 46 * walk + hop * 0.9;
+    const ay = FLOOR - 12 - lift;
+    const hip = { x: px + side * 4, y: py, z };
+    const k = ik2(hip.x, hip.y, fx, ay, D.thigh, D.shin, -1);
+    const pitch = f.swing < 0 ? 0 : lerp(0.55, -0.3, f.swing);
+    const pitchAir = hop > 2 ? 0.25 : pitch;
+    const toe = { x: k.tx + Math.cos(pitchAir) * D.footLen, y: k.ty + 12 + Math.sin(pitchAir) * D.footLen * 0.6 - (hop > 2 ? 0 : 0), z };
+    if (f.swing < 0 && hop < 2) toe.y = FLOOR;
+    return { hip, knee: { x: k.x, y: k.y, z }, ankle: { x: k.tx, y: k.ty, z }, toe };
+  };
+  const legN = legJoints(fN, +1, +1);
+  const legF = legJoints(fF, -1, -1);
+
+  // arms
+  const swingA = 0.62 * walk;
+  const thN = -swingA * Math.cos(2 * Math.PI * t / (BEAT * 2));
+  const thF = +swingA * Math.cos(2 * Math.PI * t / (BEAT * 2));
+  const armLen = 150;
+  const shoulderN = { x: sx + 3, y: sy, z: +1 }, shoulderF = { x: sx - 3, y: sy, z: -1 };
+  const hangN = { x: shoulderN.x + Math.sin(thN + 0.05) * armLen, y: shoulderN.y + Math.cos(thN + 0.05) * armLen };
+  const hangF = { x: shoulderF.x + Math.sin(thF + 0.05) * armLen, y: shoulderF.y + Math.cos(thF + 0.05) * armLen };
+  const keys = { x: LAYOUT.hand.x, y: LAYOUT.hand.y - tap * 9 };
+  const up = { x: shoulderN.x + 52, y: shoulderN.y - 150 - Math.sin(t * 40) * 3 * celebrate };
+  let tgtN = { x: lerp(hangN.x, keys.x, reach), y: lerp(hangN.y, keys.y, reach) };
+  tgtN = { x: lerp(tgtN.x, up.x, celebrate), y: lerp(tgtN.y, up.y, celebrate) };
+  const tgtF = { x: hangF.x + (hop > 0 ? -18 : 0), y: hangF.y - hop * 0.4 };
+  const aN = ik2(shoulderN.x, shoulderN.y, tgtN.x, tgtN.y, D.upperArm, D.foreArm, +1);
+  const aF = ik2(shoulderF.x, shoulderF.y, tgtF.x, tgtF.y, D.upperArm, D.foreArm, +1);
+
+  return {
+    t, walk, reach, celebrate, tap, hop, lean, facing: 1,
+    pelvis: { x: px, y: py, z: 0 }, chest: { x: lerp(px, sx, 0.55), y: lerp(py, sy, 0.55), z: 0 }, neck, head,
+    near: { hip: legN.hip, knee: legN.knee, ankle: legN.ankle, toe: legN.toe, shoulder: shoulderN, elbow: { x: aN.x, y: aN.y, z: +1 }, hand: { x: aN.tx, y: aN.ty, z: +1 } },
+    far:  { hip: legF.hip, knee: legF.knee, ankle: legF.ankle, toe: legF.toe, shoulder: shoulderF, elbow: { x: aF.x, y: aF.y, z: -1 }, hand: { x: aF.tx, y: aF.ty, z: -1 } },
+  };
+}
+
+// ---- the story around the body -----------------------------------------------------------------
+// screen.awake: laptop wakes while the hand lifts. screen.typed: 0..1 of the code on screen.
+// screen.ship: 0 -> 1 across the flip to the green "SHIPPED" state. shipAge: seconds since it passed (or -1).
+function story(t) {
+  const typed = smooth(2.38, 2.8, t);
+  const ship = smooth(SHIP_T, SHIP_T + 0.12, t);
+  const awake = smooth(1.7, 2.0, t);
+  const rows = [0.55, 0.8, 0.45, 0.2, 0.7, 0.35].map((w, i) => ({
+    w, indent: [0, 0, 0.12, 0, 0, 0.12][i],
+    len: clamp(typed * 6.4 - i, 0, 1),
+  }));
+  const chars = SCREEN_LINES.map((s, i) => s.slice(0, Math.round(s.length * clamp(typed * 6.4 - i, 0, 1))));
+  return { t, screen: { awake, typed, ship, rows, chars }, shipAge: t >= SHIP_T ? t - SHIP_T : -1 };
+}
+
+// Confetti: deterministic bits that fly up from the top of the laptop on the beat the build passes.
+function particles(t, n = 28) {
+  const age = t - SHIP_T;
+  if (age < 0 || age > 1.5) return [];
+  const out = [];
+  let s = 1234567;
+  const rnd = () => { s = (s * 1664525 + 1013904223) >>> 0; return s / 4294967296; };
+  for (let i = 0; i < n; i++) {
+    const vx = (rnd() - 0.5) * 520, vy = -(220 + rnd() * 330), w = (rnd() - 0.5) * 14;
+    const size = 8 + rnd() * 10, kind = Math.floor(rnd() * 4);
+    out.push({
+      x: LAYOUT.laptop.screen.x + LAYOUT.laptop.screen.w / 2 + vx * age,
+      y: LAYOUT.laptop.screen.y + vy * age + 520 * age * age,
+      rot: w * age, size, kind, alpha: 1 - smooth(1.0, 1.5, age), i,
+    });
+  }
+  return out;
+}
+
+// For styles that want to draw limbs as two-bone chains: [[from, to, width], ...] far side first.
+function limbs(p) {
+  const D = DIMS;
+  const L = (a, b, w) => [a, b, w];
+  const leg = (s) => [L(s.hip, s.knee, D.thighW), L(s.knee, s.ankle, D.shinW), L(s.ankle, s.toe, D.footH)];
+  const arm = (s) => [L(s.shoulder, s.elbow, D.upperArmW), L(s.elbow, s.hand, D.foreArmW)];
+  return { farLeg: leg(p.far), farArm: arm(p.far), torso: L(p.pelvis, p.neck, D.torsoW), nearLeg: leg(p.near), nearArm: arm(p.near) };
+}
+
+// Shared helpers for style code.
+const util = { clamp, lerp, smooth, easeInOut };
+function rng(seed) { let s = seed >>> 0; return () => { s = (s * 1664525 + 1013904223) >>> 0; return s / 4294967296; }; }
+
+return { W, H, FLOOR, T, BPM, BEAT, SHIP_T, LAYOUT, DIMS, SCREEN_LINES, bodyX, pose, story, particles, limbs, util, rng };
+})();
+const style = (() => {
+// 02 Blueprint: a cyanotype technical drawing. Single-weight white linework on deep blue paper, a fine and a
+// coarse grid, outline construction for the figure, live dimension callouts that read the rig, a title block,
+// and a red-orange APPROVED stamp that slams in when the build passes.
+const { W, H, LAYOUT, DIMS, pose, story, particles, util, rng } = rig;
+
+const meta = { id: '02', slug: 'blueprint', name: 'Blueprint', tag: 'cyanotype plans', accent: '#9fe6ff' };
+
+const TAU = Math.PI * 2;
+const { clamp, lerp, smooth } = util;
+
+// palette: paper centre, paper edge, ink, pale cyan, dim ink, pale fill, stamp
+const PAPER_C = '#0f4fb0', PAPER_M = '#0d47a1', PAPER_E = '#072b6c';
+const INK = '#eef9ff', CYAN = '#9fe6ff', DIM = 'rgba(206,238,255,0.5)';
+const FILL = '#d4f0ff', STAMP = '#ff5a2e', NAVY = '#0b3a8c';
+const MM = 4;                       // 1 world px = 4 mm on the sheet
+const MONO = 'ui-monospace, Menlo, monospace';
+const SANS = 'Helvetica, Arial, sans-serif';
+const FRAME = { x0: 30, y0: 30, x1: 970, y1: 970 };
+
+const mk = (w, h) => (typeof OffscreenCanvas !== 'undefined' ? new OffscreenCanvas(w, h) : Object.assign(document.createElement('canvas'), { width: w, height: h }));
+
+// ---- cached paper: gradient, fibre blotches, grids, sheet frame (does not depend on t) ----------------------
+const paperCache = new Map();
+function paper(w) {
+  let c = paperCache.get(w);
+  if (c) return c;
+  c = mk(w, w);
+  const g = c.getContext('2d'), k = w / W;
+  g.scale(k, k);
+  const rg = g.createRadialGradient(480, 420, 40, 500, 500, 780);
+  rg.addColorStop(0, PAPER_C); rg.addColorStop(0.4, PAPER_M); rg.addColorStop(0.78, '#0a3c91'); rg.addColorStop(1, PAPER_E);
+  g.fillStyle = rg; g.fillRect(0, 0, W, H);
+  const r = rng(2);
+  for (let i = 0; i < 16; i++) {            // uneven exposure
+    const x = r() * W, y = r() * H, rad = 90 + r() * 200, a = 0.025 + r() * 0.03;
+    const b = g.createRadialGradient(x, y, 0, x, y, rad);
+    b.addColorStop(0, `rgba(120,190,255,${a})`); b.addColorStop(1, 'rgba(120,190,255,0)');
+    g.fillStyle = b; g.fillRect(x - rad, y - rad, rad * 2, rad * 2);
+  }
+  for (let i = 0; i < 2600; i++) {          // paper grain
+    g.fillStyle = r() < 0.5 ? 'rgba(255,255,255,0.05)' : 'rgba(0,10,50,0.07)';
+    g.fillRect(r() * W, r() * H, 1.2, 1.2);
+  }
+  g.lineWidth = 1;
+  g.strokeStyle = 'rgba(210,235,255,0.075)'; g.beginPath();
+  for (let v = 0; v <= W; v += 20) { g.moveTo(v, 0); g.lineTo(v, H); g.moveTo(0, v); g.lineTo(W, v); }
+  g.stroke();
+  g.strokeStyle = 'rgba(220,242,255,0.2)'; g.lineWidth = 1.3; g.beginPath();
+  for (let v = 0; v <= W; v += 100) { g.moveTo(v, 0); g.lineTo(v, H); g.moveTo(0, v); g.lineTo(W, v); }
+  g.stroke();
+  // sheet frame with zone marks
+  g.strokeStyle = INK; g.lineWidth = 2;
+  g.strokeRect(FRAME.x0, FRAME.y0, FRAME.x1 - FRAME.x0, FRAME.y1 - FRAME.y0);
+  g.lineWidth = 1.2; g.strokeStyle = 'rgba(238,249,255,0.7)';
+  g.strokeRect(14, 14, W - 28, H - 28);
+  g.fillStyle = 'rgba(238,249,255,0.8)'; g.font = `10px ${MONO}`; g.textAlign = 'center'; g.textBaseline = 'middle';
+  g.beginPath();
+  for (let i = 0; i <= 8; i++) { const x = FRAME.x0 + (i * (FRAME.x1 - FRAME.x0)) / 8; g.moveTo(x, 14); g.lineTo(x, 30); g.moveTo(x, 970); g.lineTo(x, 986); }
+  for (let i = 0; i <= 8; i++) { const y = FRAME.y0 + (i * (FRAME.y1 - FRAME.y0)) / 8; g.moveTo(14, y); g.lineTo(30, y); g.moveTo(970, y); g.lineTo(986, y); }
+  g.stroke();
+  for (let i = 0; i < 8; i++) {
+    const m = FRAME.x0 + ((i + 0.5) * (FRAME.x1 - FRAME.x0)) / 8;
+    g.fillText(String(i + 1), m, 22); g.fillText(String(i + 1), m, 978);
+    g.fillText('ABCDEFGH'[i], 22, m); g.fillText('ABCDEFGH'[i], 978, m);
+  }
+  paperCache.set(w, c);
+  return c;
+}
+
+let stampCanvas = null;                      // scratch canvas for the stamp, always fully redrawn
+
+// ---- small drawing helpers -----------------------------------------------------------------------------------
+function line(ctx, x1, y1, x2, y2) { ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2); ctx.stroke(); }
+function circle(ctx, x, y, r) { ctx.beginPath(); ctx.arc(x, y, r, 0, TAU); ctx.stroke(); }
+function setInk(ctx, col, lw, alpha = 1, dash = null) { ctx.strokeStyle = col; ctx.fillStyle = col; ctx.lineWidth = lw; ctx.globalAlpha = alpha; ctx.setLineDash(dash || []); }
+function text(ctx, s, x, y, size = 14, align = 'left', col = INK, bold = false, font = MONO) {
+  ctx.font = `${bold ? '700 ' : ''}${size}px ${font}`; ctx.textAlign = align; ctx.textBaseline = 'alphabetic'; ctx.fillStyle = col; ctx.fillText(s, x, y);
+}
+function arrow(ctx, x, y, dx, dy, len = 11, wid = 3.6) {      // small filled arrowhead, tip at (x, y), pointing along (dx, dy)
+  const m = Math.hypot(dx, dy) || 1; dx /= m; dy /= m;
+  ctx.beginPath(); ctx.moveTo(x, y); ctx.lineTo(x - dx * len - dy * wid, y - dy * len + dx * wid); ctx.lineTo(x - dx * len + dy * wid, y - dy * len - dx * wid); ctx.closePath(); ctx.fill();
+}
+const DASHDOT = [16, 4, 3, 4];
+
+// diagonal hatch inside a path already set as the current clip, in the local frame of the caller
+function hatchRect(ctx, x0, y0, x1, y1, step, dir = 1) {
+  ctx.beginPath();
+  const hh = y1 - y0;
+  for (let c = x0 - hh; c < x1 + hh; c += step) { if (dir > 0) { ctx.moveTo(c, y1); ctx.lineTo(c + hh, y0); } else { ctx.moveTo(c, y0); ctx.lineTo(c + hh, y1); } }
+  ctx.stroke();
+}
+
+// a limb capsule, outlined, with a faint hatch that is anchored to the bone so it travels with the limb
+function capsule(ctx, a, b, r, o = {}) {
+  const dx = b.x - a.x, dy = b.y - a.y, L = Math.hypot(dx, dy), ang = Math.atan2(dy, dx);
+  const alpha = o.alpha ?? 1, dash = o.dash || null;
+  ctx.save(); ctx.translate(a.x, a.y); ctx.rotate(ang);
+  ctx.beginPath(); ctx.arc(0, 0, r, Math.PI / 2, Math.PI * 1.5); ctx.lineTo(L, -r); ctx.arc(L, 0, r, -Math.PI / 2, Math.PI / 2); ctx.closePath();
+  setInk(ctx, o.col || INK, 2, alpha, dash); ctx.stroke();
+  if (o.hatch) {
+    ctx.save(); ctx.clip(); setInk(ctx, o.col || INK, 1, alpha * (o.hatchA ?? 0.3));
+    hatchRect(ctx, -r, -r, L + r, r, o.hatch, o.dir || 1);
+    ctx.restore();
+  }
+  if (o.cuff) { setInk(ctx, o.col || INK, 1.6, alpha); line(ctx, L * o.cuff, -r, L * o.cuff, r); }
+  ctx.restore();
+}
+
+// the hoodie torso, drawn in a frame where u runs pelvis -> neck and v is across the body (front is +v)
+function torso(ctx, a, b, alpha) {
+  const dx = b.x - a.x, dy = b.y - a.y, L = Math.hypot(dx, dy), ang = Math.atan2(dy, dx);
+  ctx.save(); ctx.translate(a.x, a.y); ctx.rotate(ang);
+  const body = () => {
+    ctx.beginPath(); ctx.moveTo(-8, -26);
+    ctx.quadraticCurveTo(-16, 0, -8, 26);
+    ctx.bezierCurveTo(L * 0.3, 31, L * 0.78, 35, L - 12, 17);
+    ctx.quadraticCurveTo(L - 2, 10, L + 2, 2);
+    ctx.lineTo(L + 2, -3);
+    ctx.quadraticCurveTo(L - 4, -14, L - 14, -22);
+    ctx.bezierCurveTo(L * 0.7, -34, L * 0.3, -31, -8, -26);
+    ctx.closePath();
+  };
+  body(); setInk(ctx, INK, 2, alpha); ctx.stroke();
+  ctx.save(); ctx.clip(); setInk(ctx, INK, 1, alpha * 0.22); hatchRect(ctx, -20, -36, L + 4, 38, 9, -1); ctx.restore();
+  setInk(ctx, INK, 1.6, alpha);
+  ctx.beginPath(); ctx.moveTo(15, -27); ctx.quadraticCurveTo(10, 0, 15, 27); ctx.stroke();                    // hem band
+  ctx.beginPath(); ctx.moveTo(L * 0.2, 14); ctx.quadraticCurveTo(L * 0.33, 24, L * 0.46, 30); ctx.stroke();     // pocket edge
+  ctx.beginPath(); ctx.moveTo(L * 0.22, -20); ctx.quadraticCurveTo(L * 0.3, -2, L * 0.4, 8); ctx.stroke();      // back seam
+  ctx.beginPath(); ctx.arc(L - 6, -17, 15, Math.PI * 0.62, Math.PI * 1.9); ctx.stroke();                         // hood bundle
+  line(ctx, L - 8, 12, L - 46, 14); line(ctx, L - 10, 7, L - 38, 9);                                             // drawstrings
+  circle(ctx, L - 48, 14, 1.8); circle(ctx, L - 40, 9, 1.8);
+  ctx.restore();
+}
+
+function shoe(ctx, ankle, toe, alpha, dash) {
+  const hx = ankle.x - 6, hy = ankle.y + 12;
+  const dx = toe.x - hx, dy = toe.y - hy, L = Math.hypot(dx, dy), ang = Math.atan2(dy, dx);
+  ctx.save(); ctx.translate(hx, hy); ctx.rotate(ang);
+  ctx.beginPath(); ctx.moveTo(0, 0); ctx.lineTo(-1, -16); ctx.quadraticCurveTo(-1, -23, 7, -24); ctx.lineTo(15, -22);
+  ctx.quadraticCurveTo(24, -14, 30, -12); ctx.bezierCurveTo(38, -11, L - 4, -10, L + 1, -4); ctx.quadraticCurveTo(L + 3, 0, L - 2, 0); ctx.closePath();
+  setInk(ctx, INK, 2, alpha, dash); ctx.stroke();
+  ctx.save(); ctx.clip(); setInk(ctx, INK, 1, alpha * 0.4); hatchRect(ctx, -4, -26, L + 6, 2, 4, 1); ctx.restore();
+  setInk(ctx, INK, 1.4, alpha); line(ctx, 0, -5, L - 3, -5);
+  line(ctx, 17, -18, 22, -12); line(ctx, 23, -19, 27, -13);          // laces
+  ctx.restore();
+}
+
+function joint(ctx, p, r = 4.5, alpha = 1) {
+  setInk(ctx, INK, 1.4, alpha); circle(ctx, p.x, p.y, r);
+  ctx.lineWidth = 1; line(ctx, p.x - r - 5, p.y, p.x + r + 5, p.y); line(ctx, p.x, p.y - r - 5, p.x, p.y + r + 5);
+}
+
+// angle between bone a-b and bone b-c at b, plus which side the bend opens to
+function bend(a, b, c) {
+  const a1 = Math.atan2(b.y - a.y, b.x - a.x), a2 = Math.atan2(c.y - b.y, c.x - b.x);
+  let d = a2 - a1; while (d > Math.PI) d -= TAU; while (d < -Math.PI) d += TAU;
+  const vx = c.x - a.x, vy = c.y - a.y, vl = Math.hypot(vx, vy) || 1;
+  const tt = ((b.x - a.x) * vx + (b.y - a.y) * vy) / (vl * vl);
+  let ox = b.x - (a.x + vx * tt), oy = b.y - (a.y + vy * tt); const ol = Math.hypot(ox, oy);
+  if (ol < 1) { ox = -vy / vl; oy = vx / vl; } else { ox /= ol; oy /= ol; }
+  return { a1, a2, d, deg: Math.abs(d) * 180 / Math.PI, ox, oy };
+}
+function angleCallout(ctx, a, b, c, name, alpha = 1, reach = 62, lift = 14) {
+  const q = bend(a, b, c);
+  setInk(ctx, CYAN, 1.5, alpha);
+  ctx.beginPath(); ctx.arc(b.x, b.y, 34, q.a1, q.a1 + q.d, q.d < 0); ctx.stroke();                  // the flexion arc
+  setInk(ctx, CYAN, 1, alpha * 0.8, [4, 3]); line(ctx, b.x, b.y, b.x + Math.cos(q.a1) * 46, b.y + Math.sin(q.a1) * 46);
+  const am = q.a1 + q.d / 2; ctx.setLineDash([]);
+  setInk(ctx, CYAN, 1, alpha, null); arrow(ctx, b.x + Math.cos(q.a1 + q.d) * 34, b.y + Math.sin(q.a1 + q.d) * 34, -Math.sin(q.a1 + q.d) * Math.sign(q.d || 1), Math.cos(q.a1 + q.d) * Math.sign(q.d || 1), 7, 2.4);
+  void am;
+  // leader out of the bend
+  const sx = b.x + q.ox * 22, sy = b.y + q.oy * 22, ex = b.x + q.ox * reach + (q.ox >= 0 ? 8 : -8), ey = b.y + q.oy * reach * (reach > 62 ? 0.3 : 1) - lift;
+  setInk(ctx, CYAN, 1.2, alpha); line(ctx, sx, sy, ex, ey);
+  const dir = q.ox >= 0 ? 1 : -1, lab = `${name} ${Math.round(q.deg)}°`;
+  ctx.font = `700 14px ${MONO}`; const tw = ctx.measureText(lab).width;
+  line(ctx, ex, ey, ex + dir * (tw + 6), ey);
+  text(ctx, lab, ex + dir * 3, ey - 4, 14, dir > 0 ? 'left' : 'right', CYAN, true);
+  ctx.globalAlpha = alpha; ctx.fillStyle = CYAN; ctx.beginPath(); ctx.arc(sx, sy, 2.3, 0, TAU); ctx.fill();
+}
+
+// linear dimension between two points along a horizontal or vertical axis
+function dimH(ctx, x1, x2, y, label, above = true) {
+  setInk(ctx, CYAN, 1.5, 1);
+  if (x1 > x2) [x1, x2] = [x2, x1];
+  const d = x2 - x1;
+  if (d >= 34) { line(ctx, x1, y, x2, y); arrow(ctx, x1, y, -1, 0); arrow(ctx, x2, y, 1, 0); }
+  else { line(ctx, x1 - 18, y, x2 + 18, y); arrow(ctx, x1, y, 1, 0); arrow(ctx, x2, y, -1, 0); }
+  text(ctx, label, (x1 + x2) / 2, above ? y - 7 : y + 17, 14, 'center', CYAN, true);
+}
+function dimV(ctx, x, y1, y2, label) {
+  setInk(ctx, CYAN, 1.5, 1);
+  line(ctx, x, y1, x, y2); arrow(ctx, x, y1, 0, -1); arrow(ctx, x, y2, 0, 1);
+  ctx.save(); ctx.translate(x - 8, (y1 + y2) / 2); ctx.rotate(-Math.PI / 2); text(ctx, label, 0, 0, 14, 'center', CYAN, true); ctx.restore();
+}
+
+function balloon(ctx, x, y, n, tx, ty) {
+  setInk(ctx, INK, 1.4, 1);
+  const d = Math.hypot(tx - x, ty - y) || 1;
+  line(ctx, x + (tx - x) / d * 14, y + (ty - y) / d * 14, tx, ty);
+  ctx.beginPath(); ctx.arc(tx, ty, 2.4, 0, TAU); ctx.fill();
+  circle(ctx, x, y, 13);
+  text(ctx, String(n), x, y + 5, 14, 'center', INK, true);
+}
+
+// ---- the room ------------------------------------------------------------------------------------------------
+function drawWindow(ctx, t) {
+  const wn = LAYOUT.window, ix = wn.x + 10, iy = wn.y + 10, iw = wn.w - 20, ih = wn.h - 20;
+  const bot = iy + ih;
+  // glazing: night city
+  ctx.save(); ctx.beginPath(); ctx.rect(ix, iy, iw, ih); ctx.clip();
+  const r = rng(11);
+  for (let layer = 0; layer < 2; layer++) {
+    const near = layer === 1, a = near ? 1 : 0.42;
+    let x = ix - 4 + (near ? 10 : 0);
+    const pts = [];
+    while (x < ix + iw) {
+      const bw = (near ? 26 : 20) + Math.floor(r() * (near ? 22 : 16)), bh = (near ? 70 : 110) + r() * (near ? 120 : 90);
+      pts.push({ x, bw, bh, lit: r() });
+      x += bw;
+    }
+    setInk(ctx, INK, near ? 2 : 1.4, a);
+    ctx.beginPath(); ctx.moveTo(ix - 6, bot);
+    for (const b of pts) { ctx.lineTo(b.x, bot - b.bh); ctx.lineTo(b.x + b.bw, bot - b.bh); }
+    ctx.lineTo(ix + iw + 6, bot); ctx.stroke();
+    for (const b of pts) if (near) {
+      ctx.lineWidth = 1; ctx.beginPath();
+      const rr = rng(Math.floor(b.x * 7 + b.bh));
+      for (let yy = bot - b.bh + 12; yy < bot - 12; yy += 13) for (let xx = b.x + 6; xx < b.x + b.bw - 8; xx += 10) if (rr() > 0.55) ctx.rect(xx, yy, 4, 6);
+      ctx.stroke();
+      if (b.lit > 0.7) { setInk(ctx, CYAN, 1.2, 1); line(ctx, b.x + b.bw / 2, bot - b.bh, b.x + b.bw / 2, bot - b.bh - 12); circle(ctx, b.x + b.bw / 2, bot - b.bh - 15, 2.2); setInk(ctx, INK, 1, 1); }
+    }
+  }
+  // stars
+  const rs = rng(5);
+  for (let i = 0; i < 9; i++) {
+    const sx = ix + 12 + rs() * (iw - 24), sy = iy + 12 + rs() * 120, tw = 0.45 + 0.4 * Math.sin(t * 5 + i * 1.7);
+    setInk(ctx, INK, 1, tw); line(ctx, sx - 4, sy, sx + 4, sy); line(ctx, sx, sy - 4, sx, sy + 4);
+  }
+  // moon: circle with a hatched crescent
+  const mx = 276, my = 196, mr = 26;
+  setInk(ctx, INK, 2, 1); circle(ctx, mx, my, mr);
+  ctx.save(); ctx.beginPath(); ctx.arc(mx, my, mr, 0, TAU); ctx.clip();
+  ctx.beginPath(); ctx.rect(mx - 40, my - 40, 80, 80); ctx.arc(mx + 11, my - 7, mr - 3, 0, TAU); ctx.clip('evenodd');
+  setInk(ctx, INK, 1, 0.8); hatchRect(ctx, mx - 30, my - 30, mx + 30, my + 30, 3.2, 1);
+  ctx.restore();
+  setInk(ctx, INK, 1, 0.35, [3, 3]); ctx.beginPath(); ctx.arc(mx + 11, my - 7, mr - 3, 0, TAU); ctx.stroke();
+  // glass glare
+  setInk(ctx, INK, 1, 0.3); line(ctx, ix + 14, iy + 96, ix + 70, iy + 40); line(ctx, ix + 30, iy + 110, ix + 100, iy + 40);
+  line(ctx, ix + 14, iy + 260, ix + 60, iy + 214);
+  ctx.restore();
+  // frame (double line), mullions, sill
+  setInk(ctx, INK, 2, 1);
+  ctx.strokeRect(wn.x, wn.y, wn.w, wn.h); ctx.strokeRect(ix, iy, iw, ih);
+  const mxc = wn.x + wn.w / 2, myc = wn.y + 175;
+  line(ctx, mxc - 4, iy, mxc - 4, bot); line(ctx, mxc + 4, iy, mxc + 4, bot);
+  line(ctx, ix, myc - 4, ix + iw, myc - 4); line(ctx, ix, myc + 4, ix + iw, myc + 4);
+  line(ctx, wn.x - 12, wn.y + wn.h + 8, wn.x + wn.w + 12, wn.y + wn.h + 8);
+  line(ctx, wn.x - 12, wn.y + wn.h, wn.x - 12, wn.y + wn.h + 8); line(ctx, wn.x + wn.w + 12, wn.y + wn.h, wn.x + wn.w + 12, wn.y + wn.h + 8);
+  // centre line ticks
+  setInk(ctx, CYAN, 1, 0.7, DASHDOT);
+  line(ctx, mxc, wn.y - 22, mxc, wn.y - 2); line(ctx, mxc, wn.y + wn.h + 12, mxc, wn.y + wn.h + 30);
+  line(ctx, wn.x - 24, myc, wn.x - 4, myc);
+  ctx.setLineDash([]);
+}
+
+function drawClock(ctx, t) {
+  const c = LAYOUT.clock;
+  setInk(ctx, INK, 2, 1); circle(ctx, c.x, c.y, c.r); circle(ctx, c.x, c.y, c.r - 5);
+  ctx.lineWidth = 1.4;
+  for (let i = 0; i < 12; i++) { const a = i * TAU / 12, l = i % 3 === 0 ? 8 : 4; line(ctx, c.x + Math.sin(a) * (c.r - 6), c.y - Math.cos(a) * (c.r - 6), c.x + Math.sin(a) * (c.r - 6 - l), c.y - Math.cos(a) * (c.r - 6 - l)); }
+  const hand = (deg, len, lw) => { const a = deg * Math.PI / 180; ctx.lineWidth = lw; line(ctx, c.x - Math.sin(a) * 5, c.y + Math.cos(a) * 5, c.x + Math.sin(a) * len, c.y - Math.cos(a) * len); };
+  hand(305 + t * 0.5, 16, 2.2); hand(60 + t * 6, 24, 1.6);
+  setInk(ctx, CYAN, 1.2, 1); hand(Math.floor(t / 0.4) * 30, 26, 1.2);       // ticks on the beat
+  setInk(ctx, INK, 1.4, 1); circle(ctx, c.x, c.y, 2.5);
+  setInk(ctx, CYAN, 1, 0.7, DASHDOT);
+  line(ctx, c.x - c.r - 16, c.y, c.x - c.r - 2, c.y); line(ctx, c.x + c.r + 2, c.y, c.x + c.r + 16, c.y);
+  line(ctx, c.x, c.y - c.r - 16, c.x, c.y - c.r - 2);
+  ctx.setLineDash([]);
+}
+
+function plantGeometry(t, ship) {
+  const B = { x: LAYOUT.plant.x, y: LAYOUT.plant.y - 48 };
+  const angs = [-58, -38, -18, 0, 18, 38, 58], lens = [95, 125, 150, 170, 150, 125, 95];
+  const shake = ship > 0 ? Math.exp(-(t - 2.8) * 3) : 0;
+  const leaves = angs.map((deg, i) => {
+    const a = deg * Math.PI / 180 + Math.sin(t * 2.2 + i * 1.3) * 0.012 + Math.sin(t * 30 + i) * 0.03 * shake;
+    return { a, len: lens[i], tip: { x: B.x + Math.sin(a) * lens[i], y: B.y - Math.cos(a) * lens[i] } };
+  });
+  return { B, leaves };
+}
+function plantHull(ctx, g) {          // silhouette used to hide desk lines behind the plant
+  const pts = [{ x: g.B.x - 28, y: g.B.y }, ...g.leaves.map((l) => ({ x: l.tip.x + Math.sin(l.a) * 9, y: l.tip.y - 9 })), { x: g.B.x + 28, y: g.B.y }];
+  ctx.moveTo(g.B.x - 30, g.B.y + 48);
+  ctx.lineTo(g.B.x - 30, g.B.y);
+  for (const q of pts) ctx.lineTo(q.x, q.y);
+  ctx.lineTo(g.B.x + 30, g.B.y + 48); ctx.closePath();
+}
+function drawPlant(ctx, t, g) {
+  const { B } = g;
+  setInk(ctx, INK, 2, 1);
+  // pot
+  ctx.beginPath(); ctx.moveTo(B.x - 30, B.y); ctx.lineTo(B.x + 30, B.y); ctx.lineTo(B.x + 22, B.y + 48); ctx.lineTo(B.x - 22, B.y + 48); ctx.closePath(); ctx.stroke();
+  line(ctx, B.x - 33, B.y - 7, B.x + 33, B.y - 7); line(ctx, B.x - 33, B.y - 7, B.x - 30, B.y); line(ctx, B.x + 33, B.y - 7, B.x + 30, B.y);
+  ctx.save(); ctx.beginPath(); ctx.moveTo(B.x - 30, B.y); ctx.lineTo(B.x + 30, B.y); ctx.lineTo(B.x + 22, B.y + 48); ctx.lineTo(B.x - 22, B.y + 48); ctx.closePath(); ctx.clip();
+  setInk(ctx, INK, 1, 0.3); hatchRect(ctx, B.x - 34, B.y, B.x + 34, B.y + 48, 6, 1); ctx.restore();
+  for (const l of g.leaves) {
+    const mx = (B.x + l.tip.x) / 2, my = (B.y - 6 + l.tip.y) / 2, px = Math.cos(l.a), py = Math.sin(l.a), wd = l.len * 0.13;
+    setInk(ctx, INK, 2, 1);
+    ctx.beginPath(); ctx.moveTo(B.x, B.y - 6); ctx.quadraticCurveTo(mx + px * wd * 1.6, my + py * wd * 1.6, l.tip.x, l.tip.y);
+    ctx.quadraticCurveTo(mx - px * wd * 1.6, my - py * wd * 1.6, B.x, B.y - 6); ctx.closePath(); ctx.stroke();
+    setInk(ctx, INK, 1, 0.55); line(ctx, B.x, B.y - 6, lerp(B.x, l.tip.x, 0.9), lerp(B.y - 6, l.tip.y, 0.9));
+    for (let s = 0.3; s < 0.8; s += 0.17) {       // side veins
+      const vx = lerp(B.x, l.tip.x, s), vy = lerp(B.y - 6, l.tip.y, s);
+      line(ctx, vx, vy, vx + px * wd * 0.9 + Math.sin(l.a) * 5, vy + py * wd * 0.9 - 5); line(ctx, vx, vy, vx - px * wd * 0.9 + Math.sin(l.a) * 5, vy - py * wd * 0.9 - 5);
+    }
+  }
+  setInk(ctx, CYAN, 1, 0.7, DASHDOT); line(ctx, B.x, B.y - 190, B.x, B.y + 62); ctx.setLineDash([]);
+}
+
+function drawDesk(ctx, g) {
+  const d = LAYOUT.desk, top = d.y, bot = LAYOUT.floor;
+  ctx.save();
+  ctx.beginPath(); ctx.rect(0, 0, W, H); plantHull(ctx, g); ctx.clip('evenodd');
+  setInk(ctx, INK, 2, 1);
+  ctx.strokeRect(d.x, top, d.w, 16);                                       // top slab
+  ctx.strokeRect(d.x + 14, top + 16, 14, bot - top - 16);                  // legs
+  ctx.strokeRect(d.x + d.w - 28, top + 16, 14, bot - top - 16);
+  ctx.strokeRect(d.x + 28, top + 16, d.w - 56, 14);                        // rail
+  line(ctx, d.x + 14, bot - 22, d.x + 28, bot - 22); line(ctx, d.x + d.w - 28, bot - 22, d.x + d.w - 14, bot - 22);
+  for (const [x0, w0, y0, h0] of [[d.x, d.w, top, 16], [d.x + 14, 14, top + 16, bot - top - 16], [d.x + d.w - 28, 14, top + 16, bot - top - 16]]) {
+    ctx.save(); ctx.beginPath(); ctx.rect(x0, y0, w0, h0); ctx.clip(); setInk(ctx, INK, 1, 0.3); hatchRect(ctx, x0, y0, x0 + w0, y0 + h0, 6, 1); ctx.restore();
+  }
+  ctx.restore();
+}
+
+function drawLaptop(ctx, t, s) {
+  const L = LAYOUT.laptop, sc = L.screen, b = L.base, sg = s.screen;
+  // base
+  setInk(ctx, INK, 2, 1);
+  ctx.strokeRect(b.x, b.y, b.w, b.h);
+  setInk(ctx, INK, 1, 0.7, [3, 3]); line(ctx, b.x + 10, b.y + 4, b.x + b.w - 10, b.y + 4); ctx.setLineDash([]);
+  line(ctx, b.x + b.w / 2 - 22, b.y + b.h - 1, b.x + b.w / 2 + 22, b.y + b.h - 1);
+  // screen outline, bezel
+  setInk(ctx, INK, 2, 1);
+  ctx.strokeRect(sc.x, sc.y, sc.w, sc.h);
+  const ix = sc.x + 10, iy = sc.y + 10, iw = sc.w - 20, ih = sc.h - 20 + 0;
+  ctx.strokeRect(ix, iy, iw, ih);
+  line(ctx, sc.x + 70, sc.y + sc.h, sc.x + 60, b.y); line(ctx, sc.x + sc.w - 70, sc.y + sc.h, sc.x + sc.w - 60, b.y);    // hinge ticks (only the visible stub)
+  // content area clip
+  ctx.save(); ctx.beginPath(); ctx.rect(ix, iy, iw, ih); ctx.clip();
+  const aw = sg.awake;
+  setInk(ctx, INK, 1, 0.26 * (1 - aw)); hatchRect(ctx, ix, iy, ix + iw, iy + ih, 8, 1);
+  if (aw > 0.02) {
+    setInk(ctx, INK, 1.2, aw * (1 - sg.ship));
+    for (let i = 0; i < 3; i++) circle(ctx, ix + 12 + i * 10, iy + 9, 2.6);
+    line(ctx, ix + 4, iy + 18, ix + iw - 4, iy + 18);
+    ctx.globalAlpha = aw * (1 - sg.ship);
+    let lastLine = -1;
+    sg.chars.forEach((c, i) => { if (c.length) lastLine = i; });
+    const blink = Math.floor(t / 0.2) % 2 === 0;
+    for (let i = 0; i < 6; i++) {
+      const c = sg.chars[i], y = iy + 36 + i * 19;
+      text(ctx, c, ix + 6, y, 10, 'left', i === 5 ? CYAN : INK);
+      if (i === Math.max(lastLine, 0) && blink && sg.ship < 0.5) { ctx.font = `10px ${MONO}`; const tw = ctx.measureText(c).width; ctx.fillStyle = INK; ctx.fillRect(ix + 7 + tw, y - 9, 5, 11); }
+    }
+  }
+  // shipped state: the outline fills pale
+  if (sg.ship > 0) {
+    const sh = sg.ship, pop = 1 + 0.06 * Math.sin(Math.PI * clamp((t - 2.8) / 0.3));
+    ctx.globalAlpha = 0.94 * sh; ctx.fillStyle = FILL; ctx.fillRect(ix, iy, iw, ih);
+    ctx.globalAlpha = 1; ctx.save(); ctx.translate(ix + iw / 2, iy + ih / 2); ctx.scale(pop, pop * sh);
+    ctx.globalAlpha = sh;
+    setInk(ctx, NAVY, 2.6, sh); circle(ctx, 0, -26, 22);
+    ctx.beginPath(); ctx.moveTo(-10, -26); ctx.lineTo(-3, -18); ctx.lineTo(12, -36); ctx.stroke();
+    text(ctx, 'SHIPPED', 0, 24, 28, 'center', NAVY, true);
+    text(ctx, '42 TESTS PASSED', 0, 45, 11, 'center', NAVY, false);
+    ctx.restore();
+  }
+  ctx.restore();
+  // vertical centre line through the laptop
+  setInk(ctx, CYAN, 1, 0.7, DASHDOT);
+  line(ctx, sc.x + sc.w / 2 + 0.0, sc.y - 22, sc.x + sc.w / 2, sc.y - 4);
+  line(ctx, sc.x + sc.w / 2, b.y + b.h + 4, sc.x + sc.w / 2, b.y + b.h + 20);
+  ctx.setLineDash([]);
+  // the build passes: rays and a ring
+  const age = t - 2.8;
+  if (age > 0 && age < 0.7) {
+    const cx = sc.x + sc.w / 2, cy = sc.y + sc.h / 2, k = age / 0.7;
+    setInk(ctx, CYAN, 1.5, 1 - k);
+    circle(ctx, cx, cy, 100 + 150 * smooth(0, 1, k));
+    for (let i = 0; i < 18; i++) {
+      const a = i * TAU / 18 + 0.1, r0 = 106 + 60 * k, r1 = r0 + 14 + (i % 2) * 10;
+      line(ctx, cx + Math.cos(a) * r0 + 0, cy + Math.sin(a) * r0 * 0.8, cx + Math.cos(a) * r1, cy + Math.sin(a) * r1 * 0.8);
+    }
+  }
+}
+
+// ---- the figure ----------------------------------------------------------------------------------------------
+function drawFigure(ctx, t, p) {
+  const far = p.far, near = p.near;
+  const FD = [9, 6];
+  // far side, hidden-line dashes
+  capsule(ctx, far.hip, far.knee, DIMS.thighW / 2, { alpha: 0.6, dash: FD, hatch: 6, hatchA: 0.25 });
+  capsule(ctx, far.knee, far.ankle, DIMS.shinW / 2, { alpha: 0.6, dash: FD, hatch: 6, hatchA: 0.25, cuff: 0.85 });
+  shoe(ctx, far.ankle, far.toe, 0.6, FD);
+  capsule(ctx, far.shoulder, far.elbow, DIMS.upperArmW / 2, { alpha: 0.6, dash: FD });
+  capsule(ctx, far.elbow, far.hand, DIMS.foreArmW / 2, { alpha: 0.6, dash: FD, cuff: 0.8 });
+  setInk(ctx, INK, 2, 0.6, FD); circle(ctx, far.hand.x, far.hand.y, 8); ctx.setLineDash([]);
+  // torso
+  torso(ctx, p.pelvis, p.neck, 1);
+  // headphones around the neck
+  const lc = Math.cos(p.lean), ls = Math.sin(p.lean);
+  const rot = (dx, dy) => ({ x: p.neck.x + dx * lc - dy * ls, y: p.neck.y + dx * ls + dy * lc });
+  setInk(ctx, INK, 2, 1);
+  ctx.beginPath();
+  for (let i = 0; i <= 20; i++) { const a = Math.PI * 0.05 + (Math.PI * 0.95 * i) / 20, q = rot(Math.cos(a) * 27, 4 + Math.sin(a) * 18); i ? ctx.lineTo(q.x, q.y) : ctx.moveTo(q.x, q.y); }
+  ctx.stroke();
+  const cup = rot(26, 8);
+  ctx.save(); ctx.translate(cup.x, cup.y); ctx.rotate(p.lean);
+  ctx.beginPath(); ctx.roundRect(-8, -3, 16, 22, 6); ctx.stroke(); setInk(ctx, INK, 1.2, 1); ctx.beginPath(); ctx.roundRect(-4, 2, 8, 12, 3); ctx.stroke();
+  ctx.restore();
+  // near leg
+  capsule(ctx, near.hip, near.knee, DIMS.thighW / 2, { hatch: 6, hatchA: 0.3 });
+  capsule(ctx, near.knee, near.ankle, DIMS.shinW / 2, { hatch: 6, hatchA: 0.3, cuff: 0.86 });
+  shoe(ctx, near.ankle, near.toe, 1, null);
+  // near arm
+  capsule(ctx, near.shoulder, near.elbow, DIMS.upperArmW / 2, { hatch: 8, hatchA: 0.2, dir: -1 });
+  capsule(ctx, near.elbow, near.hand, DIMS.foreArmW / 2, { hatch: 8, hatchA: 0.2, dir: -1, cuff: 0.78 });
+  setInk(ctx, INK, 2, 1);
+  const hr = lerp(8.5, 11, p.celebrate); circle(ctx, near.hand.x, near.hand.y, hr);
+  if (p.celebrate > 0.5) { ctx.lineWidth = 1.4; const fa = Math.atan2(near.hand.y - near.elbow.y, near.hand.x - near.elbow.x); for (let i = -1; i <= 1; i++) { const a = fa + i * 0.6, x = near.hand.x + Math.cos(a) * hr, y = near.hand.y + Math.sin(a) * hr; line(ctx, x - Math.cos(a) * 4, y - Math.sin(a) * 4, x, y); } }
+  // tap marks over the keys
+  if (p.tap > 0.15) { setInk(ctx, CYAN, 1.5, p.tap); for (let i = -2; i <= 2; i++) { const a = -Math.PI / 2 + i * 0.5; line(ctx, near.hand.x + Math.cos(a) * 18, near.hand.y + Math.sin(a) * 18, near.hand.x + Math.cos(a) * 27, near.hand.y + Math.sin(a) * 27); } }
+
+  // neck
+  const nd = Math.atan2(p.head.y - p.neck.y, p.head.x - p.neck.x), nx = Math.cos(nd + Math.PI / 2), ny = Math.sin(nd + Math.PI / 2);
+  setInk(ctx, INK, 2, 1);
+  const hb = { x: p.head.x - Math.cos(nd) * 38, y: p.head.y - Math.sin(nd) * 38 };
+  line(ctx, p.neck.x + nx * 7, p.neck.y + ny * 7, hb.x + nx * 7, hb.y + ny * 7); line(ctx, p.neck.x - nx * 7, p.neck.y - ny * 7, hb.x - nx * 7, hb.y - ny * 7);
+  // head
+  const hd = p.head, R = hd.r;
+  ctx.save(); ctx.translate(hd.x, hd.y); ctx.rotate(hd.angle);
+  setInk(ctx, INK, 2, 1); circle(ctx, 0, 0, R);
+  // hair: a cropped cap, hatched
+  ctx.beginPath();
+  ctx.arc(0, 0, R, -0.62, 2.62, true);
+  ctx.quadraticCurveTo(-R * 0.3, R * 0.1, R * 0.15, -R * 0.28); ctx.quadraticCurveTo(R * 0.55, -R * 0.5, R * Math.cos(-0.62), R * Math.sin(-0.62)); ctx.closePath();
+  ctx.stroke();
+  ctx.save(); ctx.clip(); setInk(ctx, INK, 1, 0.55); hatchRect(ctx, -R, -R, R, R, 3.2, 1); ctx.restore();
+  // face
+  setInk(ctx, INK, 1.6, 1);
+  if (p.celebrate > 0.5) { ctx.beginPath(); ctx.arc(17, 0, 4.5, Math.PI * 1.1, Math.PI * 1.9); ctx.stroke(); }
+  else { ctx.beginPath(); ctx.arc(18, -1, 2.6, 0, TAU); ctx.fill(); }
+  line(ctx, 11, -11, 24, -12);
+  ctx.beginPath(); ctx.moveTo(37, -2); ctx.lineTo(42, 6); ctx.lineTo(36, 8); ctx.stroke();
+  ctx.beginPath(); ctx.arc(24, 12, p.celebrate > 0.5 ? 8 : 6, 0.2, p.celebrate > 0.5 ? 2.5 : 1.7); ctx.stroke();
+  circle(ctx, -9, 6, 6.5); ctx.beginPath(); ctx.arc(-9, 6, 3, 0.3, 4.2); ctx.stroke();
+  // head crosshair and centre line
+  setInk(ctx, CYAN, 1, 0.75, DASHDOT); line(ctx, -R - 12, 0, R + 12, 0); line(ctx, 0, -R - 12, 0, R + 12); ctx.setLineDash([]);
+  setInk(ctx, INK, 1.2, 1); circle(ctx, 0, 0, 3);
+  ctx.restore();
+
+  // centre line: spine and head axis, plus a vertical datum through the pelvis
+  setInk(ctx, CYAN, 1, 0.75, DASHDOT);
+  const sd = Math.atan2(p.neck.y - p.pelvis.y, p.neck.x - p.pelvis.x);
+  ctx.beginPath(); ctx.moveTo(p.pelvis.x - Math.cos(sd) * 22, p.pelvis.y - Math.sin(sd) * 22); ctx.lineTo(p.neck.x, p.neck.y); ctx.lineTo(p.head.x + Math.cos(nd) * (R + 14), p.head.y + Math.sin(nd) * (R + 14)); ctx.stroke();
+  setInk(ctx, CYAN, 1, 0.3, DASHDOT); line(ctx, p.pelvis.x, p.head.y - R - 18, p.pelvis.x, LAYOUT.floor + 18); ctx.setLineDash([]);
+  // bone lines and joints
+  setInk(ctx, INK, 1, 0.4, [6, 4]);
+  for (const s of [far, near]) { line(ctx, s.hip.x, s.hip.y, s.knee.x, s.knee.y); line(ctx, s.knee.x, s.knee.y, s.ankle.x, s.ankle.y); line(ctx, s.shoulder.x, s.shoulder.y, s.elbow.x, s.elbow.y); line(ctx, s.elbow.x, s.elbow.y, s.hand.x, s.hand.y); }
+  ctx.setLineDash([]);
+  for (const j of [far.knee, far.ankle, far.elbow]) joint(ctx, j, 4, 0.6);
+  for (const j of [near.hip, near.knee, near.ankle, near.shoulder, near.elbow]) joint(ctx, j, 4.8, 1);
+  // centre of gravity mark on the chest
+  const cg = p.chest;
+  setInk(ctx, INK, 1.4, 1); circle(ctx, cg.x, cg.y, 8);
+  ctx.beginPath(); ctx.moveTo(cg.x, cg.y); ctx.arc(cg.x, cg.y, 8, 0, Math.PI / 2); ctx.closePath(); ctx.fill();
+  ctx.beginPath(); ctx.moveTo(cg.x, cg.y); ctx.arc(cg.x, cg.y, 8, Math.PI, Math.PI * 1.5); ctx.closePath(); ctx.fill();
+  ctx.lineWidth = 1; line(ctx, cg.x - 13, cg.y, cg.x + 13, cg.y); line(ctx, cg.x, cg.y - 13, cg.x, cg.y + 13);
+}
+
+// ---- dimension callouts that read the rig -------------------------------------------------------------------
+function drawDims(ctx, t, p) {
+  const fl = LAYOUT.floor, near = p.near, far = p.far;
+  // stride: distance between the two ankles
+  const ax = near.ankle.x, bx = far.ankle.x, dy = fl + 46;
+  setInk(ctx, CYAN, 1, 0.7, [5, 3]);
+  line(ctx, ax, near.ankle.y + 10, ax, dy + 6); line(ctx, bx, far.ankle.y + 10, bx, dy + 6); ctx.setLineDash([]);
+  dimH(ctx, ax, bx, dy, `STRIDE ${Math.round(Math.abs(ax - bx) * MM)} mm`, false);
+  // height: follows the figure
+  const top = p.head.y - p.head.r, hx = clamp(p.pelvis.x - 200, 62, 900);
+  setInk(ctx, CYAN, 1, 0.55, [5, 3]); line(ctx, hx - 8, top, p.head.x - p.head.r - 14, top); ctx.setLineDash([]);
+  line(ctx, hx - 8, fl, hx + 8, fl);
+  dimV(ctx, hx, top, fl, `HEIGHT ${Math.round((fl - top) * MM)} mm`);
+  // angles
+  angleCallout(ctx, near.hip, near.knee, near.ankle, 'KNEE', 1);
+  angleCallout(ctx, near.shoulder, near.elbow, near.hand, 'ELBOW', 1, 118, 26);
+  // head leader
+  const hd = p.head; const a = -2.1;
+  setInk(ctx, CYAN, 1.2, 1);
+  const sx = hd.x + Math.cos(a) * (hd.r + 2), sy = hd.y + Math.sin(a) * (hd.r + 2), ex = sx - 22, ey = sy - 26;
+  line(ctx, sx, sy, ex, ey); line(ctx, ex, ey, ex - 92, ey);
+  text(ctx, `HEAD Ø${Math.round(hd.r * 2 * MM)}`, ex - 90, ey - 5, 13, 'left', CYAN, true);
+  balloon(ctx, hd.x + 70, hd.y - 62, 6, hd.x + 28, hd.y - 26);
+  // static room dimensions
+  const wn = LAYOUT.window;
+  dimH(ctx, wn.x, wn.x + wn.w, wn.y - 30, `${wn.w * MM}`, true);
+  setInk(ctx, CYAN, 1, 0.6, [5, 3]); line(ctx, wn.x, wn.y - 2, wn.x, wn.y - 36); line(ctx, wn.x + wn.w, wn.y - 2, wn.x + wn.w, wn.y - 36); ctx.setLineDash([]);
+  const d = LAYOUT.desk;
+  setInk(ctx, CYAN, 1, 0.6, [5, 3]); line(ctx, d.x, fl + 6, d.x, fl + 52); line(ctx, d.x + d.w, fl + 6, d.x + d.w, fl + 52); ctx.setLineDash([]);
+  dimH(ctx, d.x, d.x + d.w, fl + 46, `${d.w * MM}`, false);
+  const c = LAYOUT.clock;
+  text(ctx, `Ø${c.r * 2 * MM}`, c.x + c.r + 20, c.y - 18, 13, 'left', CYAN, true);
+  // balloons: window, clock, laptop, desk, plant
+  balloon(ctx, 372, 98, 1, wn.x + wn.w - 4, wn.y + 20);
+  balloon(ctx, 505, 120, 2, c.x + c.r * 0.7, c.y - c.r * 0.7);
+  balloon(ctx, 880, 405, 3, LAYOUT.laptop.screen.x + LAYOUT.laptop.screen.w, LAYOUT.laptop.screen.y + 40);
+  balloon(ctx, 700, 722, 4, 700, d.y + 30);
+  balloon(ctx, 945, 560, 5, LAYOUT.plant.x + 40, LAYOUT.plant.y - 160);
+}
+
+// ---- title block and parts list --------------------------------------------------------------------------------
+function drawTitle(ctx, t) {
+  const x0 = 646, y0 = 880, x1 = 966, y1 = 966, cw = (x1 - x0) / 3;
+  setInk(ctx, INK, 2, 1); ctx.strokeRect(x0, y0, x1 - x0, y1 - y0);
+  ctx.lineWidth = 1.4;
+  line(ctx, x0, y0 + 29, x1, y0 + 29); line(ctx, x0, y0 + 58, x1, y0 + 58);
+  line(ctx, x0 + cw * 2, y0, x0 + cw * 2, y1); line(ctx, x0 + cw, y0 + 29, x0 + cw, y1);
+  const cell = (cx, cy, cap, val, span = 1, col = INK) => { text(ctx, cap, x0 + cw * cx + 6, y0 + 29 * cy + 10, 8, 'left', DIM); text(ctx, val, x0 + cw * cx + 6, y0 + 29 * cy + 25, 14, 'left', col, true); void span; };
+  const done = t >= 2.95;
+  cell(0, 0, 'TITLE', 'WALK, REACH, SHIP');
+  cell(2, 0, 'SHEET', 'SHEET 02/10');
+  cell(0, 1, 'SCALE', 'SCALE 1:20');
+  cell(1, 1, 'REVISION', 'REV C');
+  cell(2, 1, 'UNITS', 'MM');
+  cell(0, 2, 'TIME', `T ${t.toFixed(2)} S`);
+  cell(1, 2, 'BEAT', `${Math.min(8, Math.floor(t / 0.4) + 1)} / 8`);
+  cell(2, 2, 'STATUS', done ? 'APPROVED' : 'IN REVIEW', 1, done ? STAMP : INK);
+  // parts list
+  const px0 = 34, py0 = 880, pw = 300, ph = 86;
+  setInk(ctx, INK, 2, 1); ctx.strokeRect(px0, py0, pw, ph);
+  ctx.lineWidth = 1.4; line(ctx, px0 + pw / 2, py0, px0 + pw / 2, py0 + ph); line(ctx, px0, py0 + 29, px0 + pw, py0 + 29); line(ctx, px0, py0 + 58, px0 + pw, py0 + 58);
+  const items = ['WINDOW', 'DESK', 'CLOCK', 'PLANT', 'LAPTOP', 'OPERATOR'];
+  items.forEach((n, i) => {
+    const col = i % 2, row = (i / 2) | 0, id = [1, 4, 2, 5, 3, 6][i];
+    const x = px0 + col * pw / 2 + 10, y = py0 + row * 29 + 19;
+    setInk(ctx, INK, 1.3, 1); circle(ctx, x + 7, y - 5, 9); text(ctx, String(id), x + 7, y - 1, 11, 'center', INK, true);
+    text(ctx, n, x + 24, y, 13, 'left', INK, true);
+  });
+}
+
+// ---- confetti and the stamp ------------------------------------------------------------------------------------
+function drawConfetti(ctx, t) {
+  const cols = [INK, CYAN, STAMP, INK, CYAN];
+  for (const q of particles(t)) {
+    const col = cols[q.i % 5], r = q.size * 0.8;
+    ctx.save(); ctx.translate(q.x, q.y); ctx.rotate(q.rot);
+    setInk(ctx, col, 2, q.alpha);
+    if (q.kind === 0) circle(ctx, 0, 0, r);
+    else if (q.kind === 1) { line(ctx, -r, 0, r, 0); line(ctx, 0, -r, 0, r); }
+    else if (q.kind === 2) { ctx.beginPath(); ctx.moveTo(0, -r); ctx.lineTo(r * 0.95, r * 0.7); ctx.lineTo(-r * 0.95, r * 0.7); ctx.closePath(); ctx.stroke(); }
+    else { ctx.beginPath(); ctx.moveTo(0, -r); ctx.lineTo(r, 0); ctx.lineTo(0, r); ctx.lineTo(-r, 0); ctx.closePath(); ctx.stroke(); }
+    ctx.restore();
+  }
+}
+
+function drawStamp(ctx, t, k) {
+  const t0 = 2.87, hit = 2.95;
+  if (t < t0) return;
+  const a = clamp((t - t0) / (hit - t0));
+  let sc = lerp(1.6, 1, a * a), alpha = clamp(a * 3);
+  const since = t - hit;
+  if (since > 0) sc = 1 + 0.07 * Math.exp(-since * 12) * Math.cos(since * 40);
+  const SW = 360, SH = 132;
+  if (!stampCanvas || stampCanvas.width !== Math.ceil(SW * k)) stampCanvas = mk(Math.ceil(SW * k), Math.ceil(SH * k));
+  const g = stampCanvas.getContext('2d');
+  g.setTransform(1, 0, 0, 1, 0, 0); g.clearRect(0, 0, stampCanvas.width, stampCanvas.height); g.setTransform(k, 0, 0, k, 0, 0);
+  g.strokeStyle = STAMP; g.fillStyle = STAMP; g.lineJoin = 'round';
+  g.lineWidth = 6; g.beginPath(); g.roundRect(5, 5, SW - 10, SH - 10, 14); g.stroke();
+  g.lineWidth = 2.5; g.beginPath(); g.roundRect(16, 16, SW - 32, SH - 32, 8); g.stroke();
+  let fs = 66; g.font = `800 ${fs}px ${SANS}`;
+  const tw = g.measureText('APPROVED').width; if (tw > SW - 66) { fs *= (SW - 66) / tw; g.font = `800 ${fs}px ${SANS}`; }
+  g.textAlign = 'center'; g.textBaseline = 'alphabetic'; g.fillText('APPROVED', SW / 2, 82);
+  g.lineWidth = 2; g.beginPath(); g.moveTo(34, 94); g.lineTo(SW - 34, 94); g.stroke();
+  g.font = `700 14px ${MONO}`; g.fillText('REV C  ·  CLEARED TO BUILD', SW / 2, 114);
+  // worn ink
+  g.globalCompositeOperation = 'destination-out';
+  const r = rng(77);
+  for (let i = 0; i < 260; i++) { g.globalAlpha = 0.35 + r() * 0.6; const x = r() * SW, y = r() * SH, s = 0.8 + r() * 2.6; g.fillRect(x, y, s * (r() < 0.3 ? 3 : 1), s); }
+  for (let i = 0; i < 5; i++) { g.globalAlpha = 0.5; const y = 22 + r() * 90; g.fillRect(r() * 300, y, 30 + r() * 60, 1.4); }
+  g.globalAlpha = 1; g.globalCompositeOperation = 'source-over';
+  const cx = 790, cy = 238, rot = -0.14;
+  ctx.save(); ctx.translate(cx, cy); ctx.rotate(rot); ctx.scale(sc, sc);
+  ctx.globalAlpha = alpha * 0.96;
+  ctx.drawImage(stampCanvas, -SW / 2, -SH / 2, SW, SH);
+  ctx.restore();
+  // impact: ink spray lines and a ring
+  if (since > 0 && since < 0.4) {
+    const e = since / 0.4;
+    ctx.save(); ctx.translate(cx, cy); ctx.rotate(rot);
+    setInk(ctx, STAMP, 2.2, 1 - e);
+    for (let i = 0; i < 22; i++) {
+      const an = i * TAU / 22, ex = Math.cos(an) * 182, ey = Math.sin(an) * 72;
+      const ee = Math.hypot(ex, ey) > 0 ? 1 : 0;
+      line(ctx, ex * (1.06 + 0.2 * e) * ee, ey * (1.14 + 0.2 * e), ex * (1.14 + 0.5 * e), ey * (1.26 + 0.5 * e));
+    }
+    ctx.restore();
+  }
+  ctx.globalAlpha = 1;
+}
+
+function render(ctx, t, w, h) {
+  const k = w / W;
+  const p = pose(t), s = story(t);
+  const since = t - 2.95, shock = since > 0 ? Math.exp(-since * 14) : 0;
+  ctx.save();
+  ctx.scale(k, k);
+  ctx.translate(shock * 4 * Math.sin(t * 110), shock * 3 * Math.cos(t * 97));
+  ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+  ctx.fillStyle = PAPER_E; ctx.fillRect(-20, -20, W + 40, H + 40);
+  ctx.drawImage(paper(w), 0, 0, W, H);
+  drawTitle(ctx, t);
+
+  ctx.save();
+  ctx.beginPath(); ctx.rect(FRAME.x0, FRAME.y0, FRAME.x1 - FRAME.x0, FRAME.y1 - FRAME.y0); ctx.clip();
+  // ground line with hatching beneath
+  const fl = LAYOUT.floor;
+  setInk(ctx, INK, 1, 0.5); ctx.beginPath(); for (let x = 20; x < 990; x += 11) { ctx.moveTo(x, fl); ctx.lineTo(x - 14, fl + 18); } ctx.stroke();
+  setInk(ctx, INK, 2, 1); line(ctx, FRAME.x0, fl, FRAME.x1, fl);
+
+  drawWindow(ctx, t);
+  drawClock(ctx, t);
+  const pg = plantGeometry(t, s.shipAge);
+  drawDesk(ctx, pg);
+  drawPlant(ctx, t, pg);
+  drawLaptop(ctx, t, s);
+  drawFigure(ctx, t, p);
+  drawDims(ctx, t, p);
+  drawConfetti(ctx, t);
+  drawStamp(ctx, t, k);
+  ctx.restore();
+
+  ctx.globalAlpha = 1; ctx.setLineDash([]);
+  ctx.restore();
+}
+
+return { meta, render };
+})();
+
+const LOOP = rig.T + 0.9;                       // a short hold on the last frame before it starts again
+function play(canvas, style) {
+  const c = canvas.getContext('2d');
+  const t0 = performance.now();
+  (function frame(now) {
+    const t = Math.min(Math.max(0, ((now - t0) / 1000) % LOOP), rig.T);   // the first rAF timestamp can be a hair before t0
+    style.render(c, t, canvas.width, canvas.height);
+    requestAnimationFrame(frame);
+  })(t0);
+}
+play(document.getElementById('c'), style);
+</script>
+</html>

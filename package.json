@@ -1,0 +1,17 @@
+{
+  "name": "reskin",
+  "version": "0.1.0",
+  "description": "One scene, ten skins: ten Claude prompts that draw the same walk in ten styles, plus the code Claude wrote for each.",
+  "license": "MIT",
+  "private": false,
+  "type": "module",
+  "author": "monoaster",
+  "repository": { "type": "git", "url": "git+https://github.com/monoaster/reskin.git" },
+  "homepage": "https://github.com/monoaster/reskin",
+  "keywords": ["claude", "prompts", "canvas", "animation", "generative-art", "creative-coding"],
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "preview": "node scripts/preview.mjs"
+  },
+  "engines": { "node": ">=22" }
+}

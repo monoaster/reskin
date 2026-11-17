@@ -1,0 +1,530 @@
+// 10 clay: Clay Stop-Motion. A plasticine animation shot on threes.
+// Time is quantised to 1/8 s (held frames), on a grid that has t = 2.8 on it so the build passes on a held frame.
+// Every object is a lumpy blob: radial gradient lit from the top left, dark rim, soft crescent shadow, a specular
+// dot and a fingerprint/dent texture (soft-light, per size, cached). On every step each object gets a tiny seeded
+// offset, rotation and squash/stretch of 1 to 3 percent, which is the handmade jitter.
+import { W, H, LAYOUT, pose, story, particles, util } from '../rig.js';
+
+export const meta = { id: '10', slug: 'clay', name: 'Clay Stop-Motion', tag: 'on threes', accent: '#f08a2d' };
+
+const { clamp, lerp, smooth } = util;
+const TAU = Math.PI * 2;
+const STEP = 0.125, T0 = 0.05;
+
+const P = {
+  wall: '#6fa8a6', table: '#dcbc86', orange: '#f08a2d', blue: '#3d62ad', navy: '#1d2d57', skin: '#f1b48f', brown: '#a6683c',
+  hair: '#4a2c20', yellow: '#f5cf3c', cream: '#efe4cb', green: '#3fbf6a', plant: '#5aae4a', pot: '#d8602a', red: '#e0503a', ink: '#1a1210',
+};
+
+let c = null, K = 1, SK = 0, PAT = null;     // context, pixels per world unit, step index, texture pattern
+
+// ---- pure helpers ----------------------------------------------------------------------------------------------
+function hash(a, b = 0, d = 0) {
+  let h = Math.imul(a | 0, 0x27d4eb2d) ^ Math.imul((b | 0) + 0x1234567, 0x165667b1) ^ Math.imul((d | 0) + 0x7654321, 0x85ebca6b);
+  h = Math.imul(h ^ (h >>> 15), 0x2c1b3c6d); h = Math.imul(h ^ (h >>> 12), 0x297a2d39); h ^= h >>> 15;
+  return (h >>> 0) / 4294967296;
+}
+const sidMemo = new Map();
+function sid(s) {
+  if (typeof s === 'number') return s | 0;
+  let v = sidMemo.get(s);
+  if (v === undefined) { v = 5381; for (let i = 0; i < s.length; i++) v = (Math.imul(v, 33) ^ s.charCodeAt(i)) | 0; sidMemo.set(s, v); }
+  return v;
+}
+function noise(seed, x) {
+  const i = Math.floor(x), f = x - i, a = hash(seed, i), b = hash(seed, i + 1), k = f * f * (3 - 2 * f);
+  return (a + (b - a) * k) * 2 - 1;
+}
+function lcg(seed) { let s = seed >>> 0; return () => { s = (s * 1664525 + 1013904223) >>> 0; return s / 4294967296; }; }
+
+const rgbMemo = new Map(), shadeMemo = new Map();
+function rgb(h) { let v = rgbMemo.get(h); if (!v) { v = [parseInt(h.slice(1, 3), 16), parseInt(h.slice(3, 5), 16), parseInt(h.slice(5, 7), 16)]; rgbMemo.set(h, v); } return v; }
+const hx = (n) => Math.max(0, Math.min(255, Math.round(n))).toString(16).padStart(2, '0');
+function shade(h, k) {          // k > 0 lighter (warm white), k < 0 darker (warm brown-black); always returns #rrggbb
+  const key = h + k; let v = shadeMemo.get(key);
+  if (!v) { const a = rgb(h), b = k >= 0 ? [255, 243, 224] : [43, 14, 6], t = Math.abs(k); v = '#' + hx(a[0] + (b[0] - a[0]) * t) + hx(a[1] + (b[1] - a[1]) * t) + hx(a[2] + (b[2] - a[2]) * t); shadeMemo.set(key, v); }
+  return v;
+}
+
+// ---- geometry ----------------------------------------------------------------------------------------------------
+function chaikin(pts, it) {
+  for (let k = 0; k < it; k++) {
+    const out = [], n = pts.length;
+    for (let i = 0; i < n; i++) { const a = pts[i], b = pts[(i + 1) % n]; out.push([a[0] * 0.75 + b[0] * 0.25, a[1] * 0.75 + b[1] * 0.25], [a[0] * 0.25 + b[0] * 0.75, a[1] * 0.25 + b[1] * 0.75]); }
+    pts = out;
+  }
+  return pts;
+}
+function catmull(Pp, per = 6) {
+  const out = [];
+  for (let i = 0; i < Pp.length - 1; i++) {
+    const p0 = Pp[Math.max(0, i - 1)], p1 = Pp[i], p2 = Pp[i + 1], p3 = Pp[Math.min(Pp.length - 1, i + 2)];
+    for (let j = 0; j < per; j++) {
+      const u = j / per, u2 = u * u, u3 = u2 * u;
+      out.push([0.5 * (2 * p1[0] + (-p0[0] + p2[0]) * u + (2 * p0[0] - 5 * p1[0] + 4 * p2[0] - p3[0]) * u2 + (-p0[0] + 3 * p1[0] - 3 * p2[0] + p3[0]) * u3),
+        0.5 * (2 * p1[1] + (-p0[1] + p2[1]) * u + (2 * p0[1] - 5 * p1[1] + 4 * p2[1] - p3[1]) * u2 + (-p0[1] + 3 * p1[1] - 3 * p2[1] + p3[1]) * u3)]);
+    }
+  }
+  out.push(Pp[Pp.length - 1]);
+  return out;
+}
+function circlePts(cx, cy, rx, ry, n = 24, rot = 0) {
+  const out = [], cr = Math.cos(rot), sr = Math.sin(rot);
+  for (let i = 0; i < n; i++) { const a = (i / n) * TAU, x = Math.cos(a) * rx, y = Math.sin(a) * ry; out.push([cx + x * cr - y * sr, cy + x * sr + y * cr]); }
+  return out;
+}
+function rrect(x, y, w, h, r) {
+  const pts = [];
+  for (const [cx, cy, a0] of [[x + w - r, y + r, -90], [x + w - r, y + h - r, 0], [x + r, y + h - r, 90], [x + r, y + r, 180]])
+    for (let i = 0; i <= 5; i++) { const a = ((a0 + i * 18) * Math.PI) / 180; pts.push([cx + Math.cos(a) * r, cy + Math.sin(a) * r]); }
+  return pts;
+}
+function capPoly(a, b, ra, rb) {      // a rounded capsule between two points
+  const dx = b[0] - a[0], dy = b[1] - a[1], l = Math.hypot(dx, dy) || 1, tx = dx / l, ty = dy / l, nx = -ty, ny = tx, pts = [];
+  for (let k = 0; k <= 8; k++) { const f = (k / 8) * Math.PI; pts.push([b[0] + (nx * Math.cos(f) + tx * Math.sin(f)) * rb, b[1] + (ny * Math.cos(f) + ty * Math.sin(f)) * rb]); }
+  for (let k = 0; k <= 8; k++) { const f = (k / 8) * Math.PI; pts.push([a[0] + (-nx * Math.cos(f) - tx * Math.sin(f)) * ra, a[1] + (-ny * Math.cos(f) - ty * Math.sin(f)) * ra]); }
+  return pts;
+}
+function dense(poly, maxLen) {
+  const out = [], n = poly.length;
+  for (let i = 0; i < n; i++) {
+    const a = poly[i], b = poly[(i + 1) % n], d = Math.hypot(b[0] - a[0], b[1] - a[1]), m = Math.max(1, Math.ceil(d / maxLen));
+    for (let k = 0; k < m; k++) out.push([a[0] + (b[0] - a[0]) * k / m, a[1] + (b[1] - a[1]) * k / m]);
+  }
+  return out;
+}
+// handmade imperfection: lumpy outline plus a per-step offset, small rotation and 1-3% squash/stretch
+function place(poly, id, o = {}) {
+  const idn = sid(id), amp = o.amp ?? 1.1, jm = o.j ?? 1;
+  let Q = dense(poly, o.sp ?? 9);
+  let cx = 0, cy = 0; for (const p of Q) { cx += p[0]; cy += p[1]; } cx /= Q.length; cy /= Q.length;
+  const n = Q.length, out = new Array(n);
+  const ang = hash(idn, SK, 1) * TAU, e = (0.01 + 0.02 * hash(idn, SK, 2)) * jm, rot = (hash(idn, SK, 3) - 0.5) * 0.025 * jm;
+  const jx = (hash(idn, SK, 4) - 0.5) * 3.2 * jm + (o.dx ?? 0), jy = (hash(idn, SK, 5) - 0.5) * 3.2 * jm + (o.dy ?? 0);
+  const ca = Math.cos(ang), sa = Math.sin(ang), cr = Math.cos(rot), sr = Math.sin(rot);
+  for (let i = 0; i < n; i++) {
+    const p = Q[i], a = Q[(i + n - 1) % n], b = Q[(i + 1) % n];
+    let nx = b[1] - a[1], ny = -(b[0] - a[0]); const l = Math.hypot(nx, ny) || 1; nx /= l; ny /= l;
+    if (nx * (p[0] - cx) + ny * (p[1] - cy) < 0) { nx = -nx; ny = -ny; }
+    const off = amp * (0.7 * noise(idn, i * 0.33) + 0.3 * noise(idn + SK * 7 + 1, i * 0.33));
+    let x = p[0] + nx * off - cx, y = p[1] + ny * off - cy;
+    // squash/stretch along a random axis, volume kept roughly constant
+    const u = x * ca + y * sa, v = -x * sa + y * ca, uu = u * (1 + e), vv = v * (1 - e * 0.8);
+    x = uu * ca - vv * sa; y = uu * sa + vv * ca;
+    out[i] = [cx + x * cr - y * sr + jx, cy + x * sr + y * cr + jy];
+  }
+  return out;
+}
+
+// ---- texture, cached per size ----------------------------------------------------------------------------------------
+const texCache = new Map(), bgCache = new Map();
+function mk(w, h = w) {
+  if (typeof OffscreenCanvas !== 'undefined') return new OffscreenCanvas(w, h);
+  const cv = document.createElement('canvas'); cv.width = w; cv.height = h; return cv;
+}
+function texFor(k) {
+  const key = Math.round(k * 1000);
+  let t = texCache.get(key);
+  if (t) return t;
+  const S = Math.max(64, Math.round(256 * k)), cv = mk(S), g = cv.getContext('2d'), R = lcg(31337), u = k;
+  g.fillStyle = '#808080'; g.fillRect(0, 0, S, S);
+  const wrap = (x, y, fn) => { for (const ox of [0, -S, S]) for (const oy of [0, -S, S]) { if ((ox && Math.abs(x) > 40 * u && Math.abs(x - S) > 40 * u) || (oy && Math.abs(y) > 40 * u && Math.abs(y - S) > 40 * u)) continue; fn(x + ox, y + oy); } };
+  for (let i = 0; i < 2600; i++) { const x = R() * S, y = R() * S, s = (0.6 + R() * 1.6) * u; g.fillStyle = R() < 0.5 ? 'rgba(0,0,0,0.12)' : 'rgba(255,255,255,0.12)'; g.fillRect(x, y, s, s); }
+  for (let i = 0; i < 70; i++) {          // dents: dark top-left, light bottom-right
+    const x = R() * S, y = R() * S, r = (3 + R() * 8) * u;
+    wrap(x, y, (xx, yy) => { g.fillStyle = 'rgba(0,0,0,0.24)'; g.beginPath(); g.arc(xx, yy, r, 0, TAU); g.fill(); g.fillStyle = 'rgba(255,255,255,0.26)'; g.beginPath(); g.arc(xx + r * 0.3, yy + r * 0.35, r * 0.85, 0, TAU); g.fill(); });
+  }
+  for (let f = 0; f < 5; f++) {           // fingerprint whorls
+    const x = R() * S, y = R() * S, rot = R() * TAU, sq = 0.7 + R() * 0.3;
+    wrap(x, y, (xx, yy) => {
+      for (let r = 3 * u; r < 34 * u; r += 3.1 * u) {
+        const a0 = R() * TAU, len = 1.6 + R() * 3.2;
+        g.strokeStyle = 'rgba(0,0,0,0.13)'; g.lineWidth = 1.3 * u; g.beginPath(); g.ellipse(xx, yy, r, r * sq, rot, a0, a0 + len); g.stroke();
+        g.strokeStyle = 'rgba(255,255,255,0.13)'; g.lineWidth = 1.1 * u; g.beginPath(); g.ellipse(xx + 1.2 * u, yy + 1.2 * u, r, r * sq, rot, a0, a0 + len); g.stroke();
+      }
+    });
+  }
+  texCache.set(key, cv);
+  return cv;
+}
+
+// ---- the clay blob --------------------------------------------------------------------------------------------------------
+function bboxOf(polys) {
+  let x0 = 1e9, y0 = 1e9, x1 = -1e9, y1 = -1e9;
+  for (const poly of polys) for (const p of poly) { if (p[0] < x0) x0 = p[0]; if (p[0] > x1) x1 = p[0]; if (p[1] < y0) y0 = p[1]; if (p[1] > y1) y1 = p[1]; }
+  return { x0, y0, x1, y1, w: x1 - x0, h: y1 - y0 };
+}
+function pathOf(polys, dx = 0, dy = 0, into = null) {
+  const path = into || new Path2D();
+  for (const poly of polys) { poly.forEach((p, i) => (i ? path.lineTo(p[0] + dx, p[1] + dy) : path.moveTo(p[0] + dx, p[1] + dy))); path.closePath(); }
+  return path;
+}
+function clay(polys, col, o = {}) {
+  const bb = bboxOf(polys), path = pathOf(polys), sz = Math.min(bb.w, bb.h);
+  c.save();
+  if (o.shadow !== false) {
+    const s = o.sh ?? 1;
+    c.shadowColor = `rgba(28,12,4,${0.34 * s})`; c.shadowBlur = 13 * K * s; c.shadowOffsetX = 8 * K * s; c.shadowOffsetY = 10 * K * s;
+  }
+  const gx = bb.x0 + bb.w * 0.3, gy = bb.y0 + bb.h * 0.26, gr = Math.hypot(bb.w, bb.h) * 0.78 + 4;
+  const g = c.createRadialGradient(gx, gy, 0, gx, gy, gr);
+  g.addColorStop(0, shade(col, 0.36)); g.addColorStop(0.3, shade(col, 0.12)); g.addColorStop(0.62, shade(col, 0)); g.addColorStop(1, shade(col, -0.34));
+  c.fillStyle = g; c.fill(path, 'evenodd');
+  c.shadowColor = 'transparent'; c.shadowBlur = 0; c.shadowOffsetX = 0; c.shadowOffsetY = 0;
+  c.clip(path, 'evenodd');
+  // crescent shadow on the side away from the light
+  const k1 = clamp(sz * 0.2, 2, 9);
+  const cres = new Path2D(); cres.rect(bb.x0 - 40, bb.y0 - 40, bb.w + 80, bb.h + 80); pathOf(polys, -k1 * 0.8, -k1, cres);
+  c.fillStyle = shade(col, -0.42); c.globalAlpha = 0.24; c.fill(cres, 'evenodd');
+  const cres2 = new Path2D(); cres2.rect(bb.x0 - 40, bb.y0 - 40, bb.w + 80, bb.h + 80); pathOf(polys, -k1 * 1.8, -k1 * 2.1, cres2);
+  c.globalAlpha = 0.13; c.fill(cres2, 'evenodd');
+  // dark rim, light inner edge on the lit side
+  c.globalAlpha = o.rim ?? 0.5; c.lineWidth = 5; c.lineJoin = 'round'; c.strokeStyle = shade(col, -0.5); c.stroke(path);
+  c.save(); c.translate(2.2, 2.6); c.globalAlpha = 0.4; c.lineWidth = 3; c.strokeStyle = shade(col, 0.55); c.stroke(path); c.restore();
+  // fingerprint / dent texture
+  if (o.tex !== false && PAT) {
+    PAT.setTransform(new DOMMatrix([1 / K, 0, 0, 1 / K, bb.x0 + hash(sid(o.id ?? 'x'), 1) * 200, bb.y0 + hash(sid(o.id ?? 'x'), 2) * 200]));
+    c.globalCompositeOperation = 'soft-light'; c.globalAlpha = o.texA ?? 0.62; c.fillStyle = PAT; c.fill(path, 'evenodd');
+    c.globalCompositeOperation = 'source-over';
+  }
+  // specular highlights
+  if (o.spec !== false && sz > 7) {
+    const r = clamp(sz * 0.3, 3.5, 22), sx = bb.x0 + bb.w * 0.3, sy = bb.y0 + bb.h * 0.24;
+    const sg = c.createRadialGradient(sx, sy, 0, sx, sy, r);
+    sg.addColorStop(0, 'rgba(255,248,235,0.62)'); sg.addColorStop(0.5, 'rgba(255,248,235,0.2)'); sg.addColorStop(1, 'rgba(255,248,235,0)');
+    c.globalAlpha = 1; c.fillStyle = sg; c.fillRect(sx - r, sy - r, r * 2, r * 2);
+  }
+  c.restore();
+}
+function bead(x, y, r, col, o = {}) {   // a cheap small ball
+  c.save();
+  if (o.shadow !== false) { c.shadowColor = 'rgba(28,12,4,0.3)'; c.shadowBlur = 5 * K; c.shadowOffsetX = 2.5 * K; c.shadowOffsetY = 3 * K; }
+  const g = c.createRadialGradient(x - r * 0.35, y - r * 0.4, 0, x - r * 0.2, y - r * 0.2, r * 1.25);
+  g.addColorStop(0, shade(col, 0.45)); g.addColorStop(0.5, shade(col, 0)); g.addColorStop(1, shade(col, -0.4));
+  c.fillStyle = g; c.beginPath(); c.arc(x, y, r, 0, TAU); c.fill();
+  c.restore();
+}
+function groove(pts, col, w = 3) {        // a line pressed into the clay with a tool: dark edge, light lip
+  c.save(); c.lineCap = 'round'; c.lineJoin = 'round';
+  const path = new Path2D(); pts.forEach((p, i) => (i ? path.lineTo(p[0], p[1]) : path.moveTo(p[0], p[1])));
+  c.translate(1.1, 1.5); c.strokeStyle = shade(col, 0.5); c.globalAlpha = 0.55; c.lineWidth = w * 0.9; c.stroke(path);
+  c.translate(-1.1, -1.5); c.strokeStyle = shade(col, -0.5); c.globalAlpha = 0.62; c.lineWidth = w; c.stroke(path);
+  c.globalAlpha = 1; c.strokeStyle = shade(col, -0.22); c.lineWidth = w * 0.45; c.stroke(path);
+  c.restore();
+}
+function softEllipse(x, y, rx, ry, a) {    // contact shadow on the table
+  c.save(); c.translate(x, y); c.scale(1, ry / rx);
+  const g = c.createRadialGradient(0, 0, 0, 0, 0, rx);
+  g.addColorStop(0, `rgba(40,20,8,${a})`); g.addColorStop(0.6, `rgba(40,20,8,${a * 0.5})`); g.addColorStop(1, 'rgba(40,20,8,0)');
+  c.fillStyle = g; c.beginPath(); c.arc(0, 0, rx, 0, TAU); c.fill(); c.restore();
+}
+
+// ---- the set (cached: painted cardboard and a tabletop never move) --------------------------------------------------------
+function brushStrokes(R, n, x0, y0, x1, y1, cols, wMin, wMax, lMin, lMax, aMin, aMax, angle = 0) {
+  c.lineCap = 'round';
+  for (let i = 0; i < n; i++) {
+    const x = x0 + R() * (x1 - x0), y = y0 + R() * (y1 - y0), l = lMin + R() * (lMax - lMin), a = angle + (R() - 0.5) * 0.06;
+    c.strokeStyle = cols[Math.floor(R() * cols.length)]; c.globalAlpha = aMin + R() * (aMax - aMin); c.lineWidth = wMin + R() * (wMax - wMin);
+    c.beginPath(); c.moveTo(x, y); c.quadraticCurveTo(x + Math.cos(a) * l * 0.5, y + Math.sin(a) * l * 0.5 + (R() - 0.5) * 4, x + Math.cos(a) * l, y + Math.sin(a) * l); c.stroke();
+  }
+  c.globalAlpha = 1;
+}
+function buildSet(w) {
+  const cv = mk(w), g = cv.getContext('2d');
+  const prevC = c, prevPat = PAT, prevSK = SK;
+  c = g; PAT = g.createPattern(texFor(w / W), 'repeat'); SK = 0;
+  g.save(); g.scale(w / W, w / W);
+  const R = lcg(9001);
+  // painted cardboard wall
+  let gr = g.createLinearGradient(0, 0, 0, 800); gr.addColorStop(0, '#7fb6b3'); gr.addColorStop(1, '#5f9996');
+  g.fillStyle = gr; g.fillRect(0, 0, W, H);
+  brushStrokes(R, 260, 0, 0, W, 800, ['#8cc2bf', '#5a928f', '#76aeab'], 12, 34, 120, 320, 0.05, 0.1);
+  brushStrokes(R, 120, 0, 0, W, 800, ['#a3d3cf'], 3, 7, 80, 220, 0.05, 0.1);
+  g.globalAlpha = 0.035; g.fillStyle = '#0b2b2a'; for (let x = 0; x < W; x += 9) g.fillRect(x, 0, 3, 800); g.globalAlpha = 1;   // corrugation
+  // window opening: painted night sky
+  const op = { x: 100, y: 150, w: 220, h: 310 };
+  gr = g.createLinearGradient(0, op.y, 0, op.y + op.h); gr.addColorStop(0, '#142245'); gr.addColorStop(0.7, '#2b4486'); gr.addColorStop(1, '#3f5fa6');
+  g.fillStyle = gr; g.fillRect(op.x, op.y, op.w, op.h);
+  g.save(); g.beginPath(); g.rect(op.x, op.y, op.w, op.h); g.clip();
+  brushStrokes(R, 90, op.x, op.y, op.x + op.w, op.y + op.h, ['#233a78', '#1a2d62', '#4a6ab4'], 8, 18, 40, 120, 0.08, 0.16);
+  g.restore();
+  for (let i = 0; i < 16; i++) { const x = op.x + 14 + R() * (op.w - 28), y = op.y + 12 + R() * 150; if (Math.hypot(x - 268, y - 214) < 50) continue; bead(x, y, 2 + R() * 2.2, P.yellow, { shadow: false }); }
+  // baseboard strip (rolled clay) and the tabletop
+  gr = g.createLinearGradient(0, 792, 0, H); gr.addColorStop(0, '#e6cb96'); gr.addColorStop(1, '#c49e63');
+  g.fillStyle = gr; g.fillRect(0, 792, W, H - 792);
+  g.lineCap = 'round';
+  for (let i = 0; i < 70; i++) { const y = 800 + R() * 170, x = R() * W, l = 120 + R() * 380; g.strokeStyle = R() < 0.5 ? '#8a5a2c' : '#f0dcae'; g.globalAlpha = 0.05 + R() * 0.07; g.lineWidth = 1 + R() * 2.4; g.beginPath(); g.moveTo(x, y); g.bezierCurveTo(x + l * 0.3, y + (R() - 0.5) * 8, x + l * 0.7, y + (R() - 0.5) * 8, x + l, y + (R() - 0.5) * 5); g.stroke(); }
+  g.globalAlpha = 1;
+  gr = g.createLinearGradient(0, 972, 0, H); gr.addColorStop(0, '#9b6334'); gr.addColorStop(1, '#6e4222');
+  g.fillStyle = gr; g.fillRect(0, 972, W, H - 972);
+  g.fillStyle = 'rgba(255,236,190,0.5)'; g.fillRect(0, 970, W, 3);
+  gr = g.createLinearGradient(0, 960, 0, 972); gr.addColorStop(0, 'rgba(60,30,10,0)'); gr.addColorStop(1, 'rgba(60,30,10,0.25)'); g.fillStyle = gr; g.fillRect(0, 960, W, 12);
+  const base = rrect(-20, 766, W + 40, 28, 12);
+  clay([place(base, 'baseboard', { j: 0, amp: 1.4, sp: 14 })], P.cream, { id: 'bb', sh: 0.8 });
+  // thumbprints and crumbs on the table
+  for (let i = 0; i < 16; i++) { const x = 40 + R() * 920, y = 830 + R() * 120, r = 10 + R() * 18; g.fillStyle = 'rgba(80,40,10,0.06)'; g.beginPath(); g.ellipse(x, y, r, r * 0.5, 0, 0, TAU); g.fill(); g.fillStyle = 'rgba(255,240,200,0.1)'; g.beginPath(); g.ellipse(x + 2, y + 2, r * 0.8, r * 0.4, 0, 0, TAU); g.fill(); }
+  const cc = [P.orange, P.yellow, P.blue, P.green, P.cream, P.red];
+  for (let i = 0; i < 13; i++) { const x = 30 + R() * 940, y = 836 + R() * 120, r = 3 + R() * 6; if (Math.abs(x - 490) < 70 && y < 870) continue; clay([place(circlePts(x, y, r, r * (0.7 + R() * 0.3), 12, R() * 3), 'crumb' + i, { j: 0, amp: 0.5, sp: 4 })], cc[i % cc.length], { id: 'cr' + i, sh: 0.4 }); }
+  // studio light: bright top left, dark corners
+  const sp = g.createRadialGradient(240, 160, 40, 400, 400, 900); sp.addColorStop(0, 'rgba(255,244,214,0.2)'); sp.addColorStop(1, 'rgba(0,0,0,0)'); g.fillStyle = sp; g.fillRect(0, 0, W, H);
+  const vg = g.createRadialGradient(500, 520, 380, 500, 520, 820); vg.addColorStop(0, 'rgba(20,8,0,0)'); vg.addColorStop(1, 'rgba(20,8,0,0.36)'); g.fillStyle = vg; g.fillRect(0, 0, W, H);
+  g.restore();
+  c = prevC; PAT = prevPat; SK = prevSK;
+  return cv;
+}
+
+// ---- the props -------------------------------------------------------------------------------------------------------------------
+function drawWindow() {
+  const wn = LAYOUT.window;
+  const blocks = [[100, 46, 80], [144, 40, 124], [182, 54, 92], [234, 36, 152], [268, 52, 108]];
+  blocks.forEach(([x, bw, bh], i) => {
+    const y = 460 - bh;
+    clay([place(rrect(x, y, bw, bh + 6, 4), 'blk' + i, { amp: 0.8 })], '#26407a', { id: 'blk' + i, sh: 0.5, texA: 0.5 });
+    for (let col = 0; col < Math.floor((bw - 8) / 12); col++) for (let row = 0; row < Math.floor((bh - 14) / 17); row++) {
+      if (hash(i * 13 + col, row, 77) < 0.5) continue;
+      bead(x + 11 + col * 12 + (hash(SK, i, col * 5 + row) - 0.5) * 0.8, y + 14 + row * 17, 3.6, P.yellow, { shadow: false });
+    }
+  });
+  // clay moon with pressed craters
+  clay([place(circlePts(268, 214, 31, 31, 28), 'moon', { amp: 0.9 })], P.yellow, { id: 'moon', sh: 0.5 });
+  for (const [dx, dy, r] of [[-9, -8, 6.5], [9, 7, 5], [-6, 12, 3.6]]) {
+    c.save(); const g = c.createLinearGradient(268 + dx - r, 214 + dy - r, 268 + dx + r, 214 + dy + r);
+    g.addColorStop(0, shade(P.yellow, -0.35)); g.addColorStop(1, shade(P.yellow, 0.3)); c.fillStyle = g; c.beginPath(); c.arc(268 + dx, 214 + dy, r, 0, TAU); c.fill(); c.restore();
+  }
+  // frame: a thick slab with the opening cut out, two rolled mullions, a sill
+  const outer = rrect(wn.x, wn.y, wn.w, wn.h, 20), hole = rrect(100, 150, 220, 310, 6).reverse();
+  clay([place(outer, 'wf', { amp: 1.2, j: 0.7 }), place(hole, 'wfh', { amp: 0.8, j: 0.7 })], P.cream, { id: 'wf', sh: 1.1 });
+  clay([place(capPoly([210, 152], [210, 458], 6.5, 6.5), 'wm1', { amp: 0.7 })], P.cream, { id: 'wm1', sh: 0.6, texA: 0.5 });
+  clay([place(capPoly([102, 293], [318, 293], 6.5, 6.5), 'wm2', { amp: 0.7 })], P.cream, { id: 'wm2', sh: 0.6, texA: 0.5 });
+  clay([place(rrect(wn.x - 14, wn.y + wn.h - 4, wn.w + 28, 22, 9), 'sill', { amp: 1 })], shade(P.cream, -0.12), { id: 'sill', sh: 1 });
+}
+function drawClock() {
+  const cl = LAYOUT.clock;
+  clay([place(circlePts(cl.x, cl.y, cl.r, cl.r, 30), 'clk', { amp: 0.9 })], P.yellow, { id: 'clk', sh: 0.8 });
+  clay([place(circlePts(cl.x, cl.y, cl.r - 8, cl.r - 8, 26), 'clkf', { amp: 0.6, j: 0.5 })], P.cream, { id: 'clkf', shadow: false, rim: 0.7, texA: 0.5 });
+  for (let i = 0; i < 12; i++) { const a = (i / 12) * TAU; bead(cl.x + Math.sin(a) * 19, cl.y - Math.cos(a) * 19, i % 3 === 0 ? 2.7 : 1.9, P.brown, { shadow: false }); }
+  const hand = (deg, len, r, id) => { const a = (deg * Math.PI) / 180; clay([place(capPoly([cl.x, cl.y], [cl.x + Math.sin(a) * len, cl.y - Math.cos(a) * len], r, r * 0.8), id, { amp: 0.3, j: 0.5 })], '#5a3420', { id, sh: 0.4, spec: false }); };
+  hand(304, 13, 2.8, 'hh'); hand(62, 19, 2.3, 'hm');
+  bead(cl.x, cl.y, 3.6, P.red, { shadow: false });
+}
+function drawTape() {
+  c.save(); c.globalAlpha = 0.9;
+  for (const [rot, id] of [[0.5, 'tp1'], [-0.5, 'tp2']]) clay([place(capPoly([494 - Math.cos(rot) * 24, 828 - Math.sin(rot) * 24], [494 + Math.cos(rot) * 24, 828 + Math.sin(rot) * 24], 4.5, 4.5), id, { amp: 0.4, j: 0.6 })], '#f4ead2', { id, sh: 0.25, texA: 0.35, spec: false });
+  c.restore();
+}
+function drawDesk(s) {
+  const d = LAYOUT.desk;
+  softEllipse(d.x + 28, 806, 40, 8, 0.4); softEllipse(d.x + d.w - 22, 806, 44, 8, 0.4);
+  clay([place(rrect(d.x + 14, d.y + 18, 22, d.h - 18, 8), 'leg1', { amp: 0.8 })], shade(P.brown, -0.12), { id: 'leg1', sh: 0.9 });
+  clay([place(rrect(d.x + d.w - 36, d.y + 18, 22, d.h - 18, 8), 'leg2', { amp: 0.8 })], shade(P.brown, -0.12), { id: 'leg2', sh: 0.9 });
+  clay([place(rrect(d.x - 6, d.y, d.w + 12, 28, 11), 'slab', { amp: 1.1 })], P.brown, { id: 'slab', sh: 1.2 });
+  groove([[d.x + 30, d.y + 14], [d.x + 150, d.y + 13], [d.x + 260, d.y + 15]], P.brown, 2.4);
+  groove([[d.x + 190, d.y + 20], [d.x + 330, d.y + 19]], P.brown, 2);
+}
+function drawPlant(t, s) {
+  const px = LAYOUT.plant.x, py = LAYOUT.plant.y, age = s.shipAge;
+  softEllipse(px + 8, 804, 54, 9, 0.4);
+  const fl = age >= 0 ? 0.1 * Math.sin(age * 20) : 0;
+  const leaves = [[-1.55, 112, 17], [-1.15, 98, 18], [-0.75, 120, 19], [-0.35, 98, 17], [0.0, 86, 16], [0.4, 108, 18]];
+  leaves.forEach(([a0, len, wd], i) => {
+    const ang = a0 + fl * (1 + i * 0.2) - Math.PI / 2 + 0.2, ox = px - 2, oy = py - 56, dx = Math.cos(ang), dy = Math.sin(ang), nx = -dy, ny = dx;
+    const poly = chaikin([[ox, oy], [ox + dx * len * 0.35 + nx * wd * 0.9, oy + dy * len * 0.35 + ny * wd * 0.9], [ox + dx * len * 0.75 + nx * wd * 0.55, oy + dy * len * 0.75 + ny * wd * 0.55], [ox + dx * len, oy + dy * len], [ox + dx * len * 0.75 - nx * wd * 0.55, oy + dy * len * 0.75 - ny * wd * 0.55], [ox + dx * len * 0.35 - nx * wd * 0.9, oy + dy * len * 0.35 - ny * wd * 0.9]], 2);
+    clay([place(poly, 'lf' + i, { amp: 0.8 })], i % 2 ? shade(P.plant, -0.08) : P.plant, { id: 'lf' + i, sh: 0.7 });
+    groove([[ox + dx * len * 0.12, oy + dy * len * 0.12], [ox + dx * len * 0.78, oy + dy * len * 0.78]], P.plant, 2.2);
+  });
+  clay([place([[px - 34, py - 58], [px + 34, py - 58], [px + 29, py - 6], [px + 22, py], [px - 22, py], [px - 29, py - 6]], 'pot', { amp: 1 })], P.pot, { id: 'pot', sh: 0.9 });
+  clay([place(capPoly([px - 33, py - 62], [px + 33, py - 62], 9, 9), 'potrim', { amp: 0.7 })], shade(P.pot, 0.12), { id: 'potrim', sh: 0.6 });
+  groove([[px - 20, py - 38], [px + 4, py - 34], [px + 20, py - 40]], P.pot, 2.4);
+}
+function drawLaptop(t, s) {
+  const L = LAYOUT.laptop, sc = L.screen, bs = L.base, scr = s.screen, ship = s.shipAge >= 0;
+  const press = clamp(Math.max(0, tapNow) * 3, 0, 2);
+  // screen housing and the recessed screen
+  clay([place(rrect(sc.x - 12, sc.y - 12, sc.w + 24, sc.h + 14, 12), 'lhouse', { amp: 0.9 })], P.cream, { id: 'lhouse', sh: 1 });
+  if (!ship) {
+    const base = scr.awake > 0.5 ? '#26376a' : '#1a2340';
+    clay([place(rrect(sc.x, sc.y, sc.w, sc.h, 6), 'lscreen', { amp: 0.5, j: 0.4 })], base, { id: 'lscreen', shadow: false, rim: 0.8, texA: 0.3, spec: false });
+    const gl = c.createLinearGradient(sc.x, sc.y, sc.x + 60, sc.y + 60); gl.addColorStop(0, 'rgba(0,0,0,0.35)'); gl.addColorStop(1, 'rgba(0,0,0,0)');
+    c.save(); c.fillStyle = gl; c.beginPath(); c.rect(sc.x, sc.y, sc.w, sc.h); c.clip(); c.fillRect(sc.x, sc.y, 80, 80); c.restore();
+    const cols = [P.yellow, P.cream, P.orange, P.green, P.cream, P.yellow];
+    scr.rows.forEach((r, i) => {
+      const x = sc.x + 14 + r.indent * 160, y = sc.y + 21 + i * 22, len = r.w * 170 * r.len;
+      if (len < 12 || scr.awake < 0.4) return;
+      clay([place(capPoly([x + 5, y], [x + len - 5, y], 5, 5), 'row' + i, { amp: 0.5, j: 0.6 })], cols[i], { id: 'row' + i, sh: 0.4, texA: 0.4 });
+    });
+  } else drawShipSlab(s);
+  // keyboard slab
+  clay([place(rrect(bs.x - 4, bs.y + press, bs.w + 8, bs.h + 2, 6), 'lbase', { amp: 0.8 })], shade(P.cream, -0.06), { id: 'lbase', sh: 0.8 });
+  for (let i = 0; i < 11; i++) groove([[bs.x + 14 + i * 19, bs.y + 6 + press], [bs.x + 20 + i * 19, bs.y + 6 + press]], P.cream, 2);
+}
+let tapNow = 0;
+function drawShipSlab(s) {
+  const sc = LAYOUT.laptop.screen, age = s.shipAge, pop = age < 0.06 ? 1.05 : 1, cx = sc.x + sc.w / 2, cy = sc.y + sc.h / 2;
+  const slab = rrect(sc.x - 2, sc.y - 2, sc.w + 4, sc.h + 4, 9).map(([x, y]) => [cx + (x - cx) * pop, cy + (y - cy) * (pop > 1 ? 0.95 : 1)]);
+  clay([place(slab, 'slab2', { amp: 0.9, j: 0.7 })], P.green, { id: 'slab2', sh: 0.8, rim: 0.6 });
+  // pressed letters: dark edge, light lip, floor of the groove
+  const S = 'SHIPPED', adv = { S: 0.7, H: 0.7, I: 0.42, P: 0.7, E: 0.7, D: 0.76 }, h = 36, gap = 0.07;
+  let tw = 0; for (const ch of S) tw += (adv[ch] + gap) * h; tw -= gap * h;
+  let x = sc.x + (sc.w - tw) / 2; const y = sc.y + sc.h / 2 - h / 2 - 8;
+  const GL = {
+    S: [[1, 0.58, 0.14, 0.42, 0.02, 0.2, 0.03, 0.07, 0.2, 0.2, 0.42, 0.45, 0.55, 0.6, 0.74, 0.46, 0.96, 0.22, 0.99, 0.04, 0.86]],
+    H: [[0, 0.06, 0, 0.06, 1], [0, 0.58, 0, 0.58, 1], [0, 0.06, 0.5, 0.58, 0.5]],
+    I: [[0, 0.18, 0, 0.18, 1], [0, 0, 0, 0.36, 0], [0, 0, 1, 0.36, 1]],
+    P: [[0, 0.06, 1, 0.06, 0], [1, 0.06, 0.02, 0.4, 0, 0.6, 0.14, 0.6, 0.36, 0.4, 0.52, 0.06, 0.52]],
+    D: [[0, 0.06, 0, 0.06, 1], [1, 0.06, 0.02, 0.4, 0, 0.62, 0.2, 0.64, 0.55, 0.45, 0.9, 0.06, 0.98]],
+    E: [[0, 0.6, 0.02, 0.06, 0, 0.06, 1, 0.62, 0.99], [0, 0.06, 0.5, 0.5, 0.5]],
+  };
+  let li = 0;
+  for (const ch of S) {
+    const jx = (hash(SK, li, 1) - 0.5) * 1.6, jy = (hash(SK, li, 2) - 0.5) * 1.6;
+    for (const st of GL[ch]) {
+      let pts = []; for (let i = 1; i < st.length; i += 2) pts.push([x + st[i] * h + jx, y + st[i + 1] * h + jy]);
+      if (st[0]) pts = catmull(pts, 5);
+      groove(pts, P.green, 6.4);
+    }
+    x += (adv[ch] + gap) * h; li++;
+  }
+  groove([[sc.x + 22, y + h + 16], [sc.x + sc.w - 24, y + h + 15]], P.green, 4.2);
+  groove([[sc.x + 30, y + h + 28], [sc.x + sc.w - 32, y + h + 28]], P.green, 4.2);
+}
+
+// ---- the character ------------------------------------------------------------------------------------------------------------------
+const OR = P.orange, DOR = shade(P.orange, -0.2), JEAN = P.blue, DJEAN = shade(P.blue, -0.2);
+function shoePoly(leg) {
+  const A = [leg.ankle.x, leg.ankle.y + 12], B = [leg.toe.x, leg.toe.y];
+  const len = Math.hypot(B[0] - A[0], B[1] - A[1]) || 40, sx = (B[0] - A[0]) / len, sy = (B[1] - A[1]) / len, nx = sy, ny = -sx;
+  const T = (a, b) => [A[0] + sx * a + nx * b, A[1] + sy * a + ny * b];
+  return { body: chaikin([T(-17, 4), T(-19, 13), T(-15, 25), T(-3, 31), T(10, 29), T(15, 18), T(30, 15), T(len - 4, 12), T(len + 7, 7), T(len + 7, 4)], 2), sole: capPoly(T(-14, 3), T(len + 2, 3), 4.5, 4.5), T, len };
+}
+function legPart(leg, far, id) {
+  const hip = [leg.hip.x, leg.hip.y], kn = [leg.knee.x, leg.knee.y], an = [leg.ankle.x, leg.ankle.y];
+  const col = far ? DJEAN : JEAN;
+  clay([place(capPoly(hip, kn, 19, 16), id + 'th', { amp: 0.9 })], col, { id: id + 'th', sh: 0.7 });
+  clay([place(capPoly(kn, an, 15.5, 12.5), id + 'sh', { amp: 0.9 })], col, { id: id + 'sh', sh: 0.7 });
+  groove([[kn[0] - 7, kn[1] - 2], [kn[0] + 5, kn[1] + 3]], col, 2.2);
+  const sh = shoePoly(leg);
+  clay([place(sh.body, id + 'shoe', { amp: 0.8 })], far ? shade(P.cream, -0.12) : P.cream, { id: id + 'shoe', sh: 0.7 });
+  clay([place(sh.sole, id + 'sole', { amp: 0.4, j: 0.5 })], '#4a3a30', { id: id + 'sole', sh: 0.4, spec: false });
+  groove([sh.T(10, 25), sh.T(30, 17)], P.cream, 2); groove([sh.T(2, 23), sh.T(20, 19)], P.cream, 2);
+  clay([place(circlePts(...sh.T(sh.len - 8, 15), 7, 5.5, 10), id + 'cap', { amp: 0.3, j: 0.6 })], P.red, { id: id + 'cap', sh: 0.3, spec: false });
+}
+function handPart(h, fist, far, id) {
+  if (fist) {
+    clay([place(circlePts(h.x, h.y, 15, 14, 18), id, { amp: 0.7 })], P.skin, { id, sh: 0.6 });
+    for (let i = 0; i < 3; i++) groove([[h.x + 2 + i * 4.5, h.y - 11], [h.x + 5 + i * 4, h.y + 3]], P.skin, 1.8);
+  } else clay([place(circlePts(h.x + 3, h.y + 1, 12.5, 11, 16), id, { amp: 0.7 })], far ? shade(P.skin, -0.1) : P.skin, { id, sh: 0.6 });
+}
+function armPart(arm, far, id) {
+  const sh = [arm.shoulder.x, arm.shoulder.y], el = [arm.elbow.x, arm.elbow.y], h = [arm.hand.x, arm.hand.y];
+  const dx = h[0] - el[0], dy = h[1] - el[1], L = Math.hypot(dx, dy) || 1, wr = [h[0] - dx / L * 12, h[1] - dy / L * 12];
+  const col = far ? DOR : OR;
+  clay([place(capPoly(sh, el, 15, 13), id + 'u', { amp: 0.8 })], col, { id: id + 'u', sh: 0.7 });
+  clay([place(capPoly(el, wr, 13, 11), id + 'f', { amp: 0.8 })], col, { id: id + 'f', sh: 0.7 });
+  const nx = -dy / L, ny = dx / L;
+  clay([place(capPoly([wr[0] + nx * 8, wr[1] + ny * 8], [wr[0] - nx * 8, wr[1] - ny * 8], 5.5, 5.5), id + 'cuff', { amp: 0.4, j: 0.6 })], shade(col, -0.12), { id: id + 'cuff', sh: 0.4, spec: false });
+}
+function drawHead(p, sqx, sqy, s) {
+  const h = p.head, th = h.angle, cs = Math.cos(th), sn = Math.sin(th), R = h.r;
+  const T = (x, y) => [h.x + x * cs - y * sn, h.y + x * sn + y * cs];
+  const happy = p.celebrate > 0.5 || s.shipAge >= 0;
+  clay([place(circlePts(h.x, h.y, R * sqx, R * sqy, 34, th), 'head', { amp: 0.9 })], P.skin, { id: 'head', sh: 0.9 });
+  clay([place(circlePts(...T(-14, 8), 7, 9, 14, th), 'ear', { amp: 0.4, j: 0.6 })], shade(P.skin, -0.08), { id: 'ear', sh: 0.4, spec: false });
+  // hair: a lumpy cap
+  const hair = [];
+  for (let a = 140; a <= 342; a += 11) { const q = (a * Math.PI) / 180, rr = R + 3; hair.push(T(Math.cos(q) * rr, Math.sin(q) * rr)); }
+  for (const [x, y] of [[34, -12], [25, -20], [9, -18], [-6, -9], [-16, 4], [-24, 15], [-27, 24]]) hair.push(T(x, y));
+  clay([place(hair, 'hair', { amp: 1.3 })], P.hair, { id: 'hair', sh: 0.5, texA: 0.7 });
+  for (let i = 0; i < 3; i++) clay([place(circlePts(...T(-12 + i * 15, -R + 1), 7, 6, 10), 'curl' + i, { amp: 0.4, j: 1 })], P.hair, { id: 'curl' + i, sh: 0.3, spec: false });
+  // nose, eyes, mouth
+  clay([place(circlePts(...T(R - 3, 8), 6.5, 6, 12), 'nose', { amp: 0.3, j: 0.6 })], shade(P.skin, -0.14), { id: 'nose', sh: 0.5 });
+  const ey = happy ? 0.55 : 1;
+  for (const [ex, id] of [[12, 'eyeA'], [28, 'eyeB']]) {
+    const e = T(ex, -3);
+    clay([place(circlePts(e[0], e[1], 4.2, 4.2 * ey, 12), id, { amp: 0.1, j: 0.3 })], P.ink, { id, shadow: false, tex: false, rim: 0.2 });
+    bead(e[0] - 1.2, e[1] - 1.4 * ey, 1.3, '#ffffff', { shadow: false });
+  }
+  if (happy) groove(catmull([T(14, 15), T(23, 25), T(34, 13)], 6), P.skin, 3.4); else groove([T(18, 22), T(30, 21)], P.skin, 3);
+  c.save(); const cp = T(23, 13); const cg = c.createRadialGradient(cp[0], cp[1], 0, cp[0], cp[1], 9); cg.addColorStop(0, 'rgba(235,90,70,0.35)'); cg.addColorStop(1, 'rgba(235,90,70,0)'); c.fillStyle = cg; c.fillRect(cp[0] - 9, cp[1] - 9, 18, 18); c.restore();
+}
+function drawChar(t, p, s, tq) {
+  // exaggerated squash and stretch around the feet: anticipation, stretch in the air, squash on landing
+  let sy = 1;
+  if (tq >= 2.8 - 1e-6) { const hk = clamp((tq - 2.84) / 0.34, 0, 1); sy = tq < 2.84 ? 0.9 : hk < 0.9 ? 1.1 + 0.03 * Math.sin(hk * 3) : 0.86; }
+  const sx = 1 / Math.sqrt(sy), px = p.pelvis.x;
+  const J = (j) => ({ x: px + (j.x - px) * sx, y: 800 + (j.y - 800) * sy });
+  const mapLeg = (l) => ({ hip: J(l.hip), knee: J(l.knee), ankle: J(l.ankle), toe: J(l.toe), shoulder: J(l.shoulder), elbow: J(l.elbow), hand: J(l.hand) });
+  const near = mapLeg(p.near), far = mapLeg(p.far), pelvis = J(p.pelvis), neck = J(p.neck), head = { ...J(p.head), r: p.head.r, angle: p.head.angle };
+  const q = { ...p, near, far, pelvis, neck, head };
+  // table contact shadow
+  const air = clamp(p.hop / 34, 0, 1);
+  softEllipse(px + 12, 806, 86 - 22 * air, 12, 0.5 - 0.22 * air);
+  // far side first, then near leg, torso, headphones, head, near arm
+  armPart(far, true, 'fArm'); handPart(far.hand, false, true, 'fHand');
+  legPart(far, true, 'fLeg'); legPart(near, false, 'nLeg');
+  clay([place(capPoly([neck.x, neck.y + 6], [head.x, head.y], 11, 11), 'neck', { amp: 0.5, j: 0.6 })], shade(P.skin, -0.06), { id: 'neck', sh: 0.5 });
+  const dx = neck.x - pelvis.x, dy = neck.y - pelvis.y, Lt = Math.hypot(dx, dy), ux = dx / Lt, uy = dy / Lt, vx = -uy, vy = ux;
+  const TF = (a, b) => [pelvis.x + ux * a + vx * b, pelvis.y + uy * a + vy * b];
+  const ctrl = [[-14, -32], [-17, 2], [-14, 35], [10, 40], [48, 39], [84, 35], [112, 31], [124, 18], [131, 5], [137, -10], [137, -26], [124, -38], [100, -42], [74, -37], [44, -36], [12, -35]].map(([a, b]) => TF(a, b));
+  clay([place(chaikin(ctrl, 3), 'hoodie', { amp: 1.4, sp: 12 })], OR, { id: 'hoodie', sh: 1 });
+  groove([TF(3, -32), TF(7, 0), TF(3, 35)], OR, 3);
+  groove(catmull([TF(54, 37), TF(38, 24), TF(24, 22), TF(12, 38)], 5), OR, 2.8);
+  groove([TF(62, -24), TF(68, -8)], OR, 2.2);
+  // hood: a thick rolled collar behind the neck
+  clay([place(capPoly(TF(116, -14), TF(130, -24), 11, 10), 'hood', { amp: 0.8 }), place(capPoly(TF(130, -24), TF(124, -34), 10, 9), 'hood2', { amp: 0.8 })], shade(OR, -0.08), { id: 'hood', sh: 0.6 });
+  // drawstrings
+  groove(catmull([TF(114, 14), TF(100, 15), TF(86, 10)], 5), OR, 2.4); bead(...TF(84, 10), 3, P.cream);
+  // headphones: a thin rolled coil round the neck and a ball cup on the chest
+  clay([place(capPoly(TF(118, 22), TF(134, 14), 4.2, 4.2), 'hp1', { amp: 0.3, j: 0.6 }), place(capPoly(TF(134, 14), TF(140, -6), 4.2, 4.2), 'hp2', { amp: 0.3, j: 0.6 }), place(capPoly(TF(140, -6), TF(130, -26), 4.2, 4.2), 'hp3', { amp: 0.3, j: 0.6 })], P.yellow, { id: 'hp', sh: 0.5, spec: false });
+  clay([place(circlePts(...TF(106, 25), 14.5, 14.5, 20), 'cup', { amp: 0.7 })], P.yellow, { id: 'cup', sh: 0.8 });
+  clay([place(circlePts(...TF(106, 25), 7.5, 7.5, 14), 'cup2', { amp: 0.3, j: 0.5 })], shade(P.yellow, -0.22), { id: 'cup2', shadow: false, rim: 0.7, spec: false });
+  drawHead(q, sx, sy, s);
+  armPart(near, false, 'nArm'); handPart(near.hand, p.celebrate > 0.45, false, 'nHand');
+}
+
+function drawConfetti(tq) {
+  const cols = [P.orange, P.yellow, P.blue, P.green, P.cream, P.red], now = particles(tq), next = particles(tq + 0.03);
+  now.forEach((q, i) => {
+    const nx = next[i];
+    let vx = 0, vy = 0; if (nx) { vx = nx.x - q.x; vy = nx.y - q.y; }
+    const sp = Math.hypot(vx, vy), ang = Math.atan2(vy, vx), st = 1 + clamp(sp / 40, 0, 0.18), r = q.size * 1.15, col = cols[q.i % cols.length];
+    let poly;
+    if (q.kind === 0) poly = circlePts(q.x, q.y, r, r, 14, ang);
+    else if (q.kind === 1) poly = circlePts(q.x, q.y, r * 1.2, r * 0.8, 12, q.rot * 3 + q.i);
+    else if (q.kind === 2) poly = capPoly([q.x - r, q.y], [q.x + r, q.y], r * 0.38, r * 0.38).map(([x, y]) => { const dx = x - q.x, dy = y - q.y, c1 = Math.cos(q.rot * 4 + q.i), s1 = Math.sin(q.rot * 4 + q.i); return [q.x + dx * c1 - dy * s1, q.y + dx * s1 + dy * c1]; });
+    else poly = circlePts(q.x, q.y, r * 1.05, r * 0.7, 14, q.rot * 2);
+    // stretch along the direction of travel
+    const ca = Math.cos(ang), sa = Math.sin(ang);
+    poly = poly.map(([x, y]) => { const dx = x - q.x, dy = y - q.y, u = dx * ca + dy * sa, v = -dx * sa + dy * ca, uu = u * st, vv = v / Math.sqrt(st); return [q.x + uu * ca - vv * sa, q.y + uu * sa + vv * ca]; });
+    c.save(); c.globalAlpha = q.alpha;
+    clay([place(poly, 'cf' + q.i, { amp: 0.5, j: 0.4, sp: 6 })], col, { id: 'cf' + q.i, sh: 0.5, texA: 0.5 });
+    c.restore();
+  });
+}
+
+// ---- main ---------------------------------------------------------------------------------------------------------------------------------
+export function render(ctx, t, w, h) {
+  K = w / W; c = ctx;
+  const k = Math.floor((clamp(t, 0, 3.2) - T0) / STEP + 1e-6), tq = Math.max(0, T0 + k * STEP);
+  SK = k;
+  let set = bgCache.get(w);
+  if (!set) { set = buildSet(w); bgCache.set(w, set); c = ctx; }
+  PAT = ctx.createPattern(texFor(K), 'repeat');
+  const p = pose(tq), s = story(tq); tapNow = p.tap;
+  ctx.save();
+  ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.globalAlpha = 1; ctx.globalCompositeOperation = 'source-over'; ctx.shadowColor = 'transparent';
+  ctx.drawImage(set, 0, 0, w, w);
+  ctx.scale(K, K);
+  drawWindow();
+  drawClock();
+  drawTape();
+  drawDesk(s);
+  drawPlant(tq, s);
+  drawLaptop(tq, s);
+  drawChar(t, p, s, tq);
+  drawConfetti(tq);
+  // studio light flicker between exposures
+  const fl = hash(k, 99, 7) * 2 - 1;
+  ctx.globalAlpha = Math.abs(fl) * (fl > 0 ? 0.03 : 0.04); ctx.fillStyle = fl > 0 ? '#fff0d0' : '#150800'; ctx.fillRect(0, 0, W, H);
+  ctx.globalAlpha = 1;
+  ctx.restore();
+}

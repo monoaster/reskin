@@ -1,0 +1,465 @@
+// 06 Isometric Voxel: the whole scene is cubes in a true isometric view (30 degree axes, 12 unit cubes).
+// The room (floor, walls, window, desk, laptop, plant, lamp) is built once as a cube set and cached as an image per
+// size. The figure is voxelised from pose(t) on every call: each limb capsule, the torso, the head are filled with
+// cubes, merged into one set (colour by body part) and drawn far-to-near with three shaded faces per cube.
+import { W, H, LAYOUT, DIMS, pose, story, particles, util, rng } from '../rig.js';
+
+export const meta = { id: '06', slug: 'voxel', name: 'Isometric Voxel', tag: 'cubes', accent: '#ff9a3c' };
+
+const { clamp, lerp } = util;
+const S = 12;                         // cube edge in world units
+const FA = 0.8660254;                 // cos 30
+const FLOOR_Y = 800;
+
+// ---- camera: true isometric. World X runs down-right, Z runs down-left, height runs up -----------------------
+const XA = -132, XB = 1008, ZA = -108, ZB = 132, HWALL = 58 * S, SLAB = 3 * S;
+const uMin = (XA - ZB) * FA, uMax = (XB - ZA) * FA;
+const vTop = (XA + ZA) * 0.5 - HWALL, vBot = (XB + ZB) * 0.5 + SLAB;
+const SC = Math.min(968 / (uMax - uMin), 968 / (vBot - vTop));
+const CX = 500 - ((uMin + uMax) / 2) * SC, CY = 500 - ((vTop + vBot) / 2) * SC;
+const EX = S * FA * SC, EY = S * 0.5 * SC, EH = S * SC;     // screen vectors of one cube edge along X, Z, height
+
+// ---- colour helpers (colours are packed 0xRRGGBB integers) ----------------------------------------------------
+const hex = (s) => parseInt(s.slice(1), 16);
+const R = (c) => (c >> 16) & 255, G = (c) => (c >> 8) & 255, B = (c) => c & 255;
+const pack = (r, g, b) => (clamp(Math.round(r), 0, 255) << 16) | (clamp(Math.round(g), 0, 255) << 8) | clamp(Math.round(b), 0, 255);
+const mul = (c, f) => pack(R(c) * f, G(c) * f, B(c) * f);
+const mix = (a, b, k) => pack(lerp(R(a), R(b), k), lerp(G(a), G(b), k), lerp(B(a), B(b), k));
+const cssCache = new Map();
+const css = (c) => { let s = cssCache.get(c); if (!s) { s = `rgb(${R(c)},${G(c)},${B(c)})`; cssCache.set(c, s); } return s; };
+const hash = (i, j, k) => { let h = Math.imul(i, 374761393) ^ Math.imul(j, 668265263) ^ Math.imul(k, 1274126177); h = Math.imul(h ^ (h >>> 13), 1274126177); return ((h ^ (h >>> 16)) >>> 0) / 4294967296; };
+const FT = 1.14, FL = 0.84, FR = 0.6;            // face shading: top light, left mid, right dark
+const FE = [1.0, 0.94, 0.86];                    // emissive cubes barely shade
+
+// palette: wall blue, wood floor (two tiles), desk wood, hoodie coral, jeans blue, sneaker cream + orange toe,
+// skin, lamp orange, plant green, night sky navy, window cream, screen green.
+const P = {
+  wallHi: hex('#6f9bdc'), wallLo: hex('#4f78bd'), floorA: hex('#cf9f66'), floorB: hex('#b98450'), slab: hex('#7d5532'),
+  deskTop: hex('#c08550'), desk: hex('#8f5c36'), hoodie: hex('#ff6b4a'), sleeve: hex('#f25a3b'), hem: hex('#d94a30'),
+  jeans: hex('#26306e'), cuff: hex('#6f8fe0'), sole: hex('#f7f3ea'), upper: hex('#ebe7dd'), toe: hex('#ff9a3c'),
+  skin: hex('#f2c3a0'), hair: hex('#2f1d16'), dark: hex('#1b1626'), phone: hex('#22252f'), cup: hex('#2dd4c4'),
+  cream: hex('#efe3cb'), silver: hex('#c5ccd8'), silverDk: hex('#98a2b4'), pot: hex('#dc7a3c'), leaf: hex('#3fb35a'),
+  green: hex('#17b26a'), white: 0xffffff,
+};
+
+// ---- cube set helpers -----------------------------------------------------------------------------------------
+const key = (i, j, k) => ((i + 64) * 128 + (j + 16)) * 64 + (k + 32);
+const colKey = (i, k) => (i + 64) * 64 + (k + 32);
+
+// ---- the static room -----------------------------------------------------------------------------------------
+const LAMP = { x: 930, h: 292, z: -60 };              // warm lamp on the desk
+const lampTint = (c, x, h, z) => {
+  const d2 = (x - LAMP.x) ** 2 + (h - LAMP.h) ** 2 + (z - LAMP.z) ** 2;
+  const w = Math.exp(-d2 / (2 * 400 * 400));
+  return pack(R(c) * (1 + 0.16 * w) + 40 * w, G(c) * (1 + 0.08 * w) + 18 * w, B(c) * (1 - 0.06 * w));
+};
+
+const WIN = { i0: 7, i1: 28, j0: 27, j1: 55 };
+const DESK = { i0: 47, i1: 79, k0: -8, k1: 5 };
+const LAPTOP = { bi0: 50, bi1: 69, bk0: -4, bk1: 3, si0: 52, si1: 67, sj0: 16, sj1: 28 };
+const KW = -9;                                       // back wall cell row
+const IW = -11;                                      // side wall cell column
+
+let STATIC = null;
+function buildStatic() {
+  const M = new Map();
+  const add = (i, j, k, c, e = 0) => { M.set(key(i, j, k), { i, j, k, c, e }); };
+  const del = (i, j, k) => M.delete(key(i, j, k));
+  // shadow footprint on the floor, shifted one cube to the left of each prop
+  const inRect = (i, k, r) => i >= r.i0 - 1 && i <= r.i1 - 1 && k >= r.k0 && k <= r.k1;
+  const plantRect = { i0: 71, i1: 75, k0: 7, k1: 10 };
+  // floor slab, three cubes thick, checker tiles of 2 x 2 cubes
+  for (let i = IW; i <= 83; i++) for (let k = KW; k <= 10; k++) for (let j = -3; j <= -1; j++) {
+    let c;
+    if (j < -1) c = P.slab;
+    else {
+      c = ((i >> 1) + (k >> 1)) & 1 ? P.floorA : P.floorB;
+      const X = (i + 0.5) * S, Z = (k + 0.5) * S;
+      if (inRect(i, k, DESK)) c = mul(c, 0.62);
+      else if (inRect(i, k, plantRect)) c = mul(c, 0.72);
+      // moonlight from the window, four panes, falls forward and slightly right
+      const lz = (Z + 96);
+      const xs = X - lz * 0.4;
+      const pane = (xs > 98 && xs < 198) || (xs > 222 && xs < 336);
+      if (pane && lz > 0 && lz < 330) c = mix(c, hex('#9fbaff'), 0.22 * (1 - lz / 330));
+    }
+    add(i, j, k, c);
+  }
+  // back wall and side wall: stripes of wainscot and wall colour
+  const wallColour = (j, i, k) => (j < 13 ? P.wallLo : j === 13 ? mul(P.wallLo, 0.85) : P.wallHi);
+  for (let i = IW; i <= 83; i++) for (let j = 0; j < 58; j++) add(i, j, KW, wallColour(j, i, KW));
+  for (let k = KW + 1; k <= 10; k++) for (let j = 0; j < 58; j++) add(IW, j, k, wallColour(j, IW, k));
+  // skirting
+  for (let i = IW + 1; i <= 83; i++) add(i, 0, KW + 1, mul(P.wallLo, 0.7));
+  for (let k = KW + 2; k <= 10; k++) add(IW + 1, 0, k, mul(P.wallLo, 0.7));
+
+  // window: open the wall, frame it in cream, put a night city a few cubes behind
+  for (let i = WIN.i0; i <= WIN.i1; i++) for (let j = WIN.j0; j <= WIN.j1; j++) {
+    const ring = i === WIN.i0 || i === WIN.i1 || j === WIN.j0 || j === WIN.j1;
+    const mull = i === 17 || i === 18 || j === 41;
+    if (ring || mull) { add(i, j, KW, P.cream); if (ring) add(i, j, KW + 1, P.cream); else add(i, j, KW, mul(P.cream, 0.95)); } else del(i, j, KW);
+  }
+  for (let i = WIN.i0 - 1; i <= WIN.i1 + 1; i++) { add(i, WIN.j0 - 1, KW + 1, mul(P.cream, 0.92)); add(i, WIN.j0 - 1, KW + 2, mul(P.cream, 0.92)); }
+  const sky = ['#07102c', '#0a1438', '#0d1a44', '#141f55', '#1f2662', '#2d2d70', '#403078'].map(hex);
+  for (let i = 4; i <= 29; i++) for (let j = 22; j <= 55; j++) add(i, j, KW - 2, sky[clamp(Math.floor(((55 - j) / 34) * sky.length), 0, sky.length - 1)]);
+  const rs = rng(31);
+  for (let n = 0; n < 16; n++) add(5 + Math.floor(rs() * 23), 42 + Math.floor(rs() * 13), KW - 2, hex(rs() < 0.5 ? '#c9d6ff' : '#fff0b0'), 1);
+  const rb = rng(8);
+  const skyline = (kk, base, minH, maxH, col, lit, step) => {
+    let i = 3;
+    while (i < 30) {
+      const bw = 2 + Math.floor(rb() * 3), bh = minH + Math.floor(rb() * (maxH - minH));
+      for (let a = 0; a < bw; a++) for (let j = base; j < base + bh; j++) {
+        const isWin = (j - base) % 2 === 1 && a % 2 === 0 && j < base + bh - 1 && rb() < 0.55;
+        if (isWin && lit) add(i + a, j, kk, hex(rb() < 0.7 ? '#ffd36b' : '#7fe8ff'), 1); else add(i + a, j, kk, col);
+      }
+      i += bw + (step ? 0 : 0);
+    }
+  };
+  skyline(KW - 2, 22, 8, 22, hex('#1c2158'), true);
+  skyline(KW - 1, 22, 4, 14, hex('#10143a'), true);
+  // moon: a disc of cubes with a shaded bite, in the top right pane
+  for (let i = 18; i <= 27; i++) for (let j = 41; j <= 53; j++) {
+    const d = (i - 22) ** 2 + (j - 47) ** 2;
+    if (d <= 6.3) { const bite = (i - 23) ** 2 + (j - 48) ** 2 <= 4.2; add(i, j, KW - 1, bite ? hex('#dcd29a') : hex('#fff3bf'), 1); }
+  }
+
+  // clock disc on the wall: dark rim, cream face, four hour marks
+  const cI = LAYOUT.clock.x, cH = FLOOR_Y - LAYOUT.clock.y;
+  for (let i = 29; i <= 42; i++) for (let j = 48; j <= 62; j++) {
+    const X = (i + 0.5) * S, Hh = (j + 0.5) * S, d = Math.hypot(X - cI, Hh - cH);
+    if (d > 47) continue;
+    const an = Math.atan2(X - cI, Hh - cH), mark = d > 26 && [0, 1, 2, 3].some((q) => Math.abs(Math.sin(an - q * Math.PI / 2)) < 0.3 && Math.cos(an - q * Math.PI / 2) > 0.9);
+    add(i, j, KW + 1, d > 38 ? hex('#3a3f66') : mark ? hex('#3a3f66') : hex('#f6f0df'));
+  }
+  // shelf with books, a mug and a small plant, above the desk
+  for (let i = 52; i <= 71; i++) { add(i, 40, KW + 1, P.desk); add(i, 40, KW + 2, P.deskTop); }
+  const books = [['#e5483a', 3], ['#2dd4c4', 4], ['#ffd23f', 3], ['#7a5cff', 2], ['#ff9a3c', 4], ['#4cc9f0', 3]];
+  books.forEach(([c, h], n) => { for (let j = 41; j < 41 + h; j++) add(52 + n, j, KW + 1, hex(c)); });
+  for (let j = 41; j <= 42; j++) add(60, j, KW + 2, hex('#f6f0df'));
+  add(66, 41, KW + 1, hex('#dc7a3c')); add(66, 42, KW + 1, P.leaf); add(66, 43, KW + 1, P.leaf); add(65, 43, KW + 1, hex('#56c46e')); add(67, 43, KW + 1, hex('#56c46e')); add(66, 44, KW + 1, hex('#56c46e'));
+  add(70, 41, KW + 2, hex('#f6f0df')); add(70, 42, KW + 2, hex('#f6f0df'));
+  // warm string lights, two swags along the wall
+  for (const [i0, i1] of [[46, 64], [64, 82]]) for (let i = i0; i <= i1; i++) {
+    const j = 56 - Math.round(5 * Math.sin(Math.PI * (i - i0) / (i1 - i0)));
+    add(i, j, KW + 1, hex('#4a3b34'));
+    if ((i - i0) % 3 === 1) { add(i, j - 1, KW + 1, hex('#ffe08a'), 1); add(i, j - 2, KW + 1, hex('#ffc95e'), 1); }
+  }
+  // poster on the side wall: a small sunset, 7 wide and 11 tall
+  for (let kk = -7; kk <= -1; kk++) for (let j = 30; j <= 40; j++) {
+    const edge = kk === -7 || kk === -1 || j === 30 || j === 40;
+    let c = j >= 37 ? hex('#2a2f6b') : j >= 35 ? hex('#7a3f93') : hex('#e5645f'), em = 0;
+    if (!edge && (kk + 4) ** 2 + (j - 35) ** 2 <= 1.5) { c = hex('#ffd36b'); em = 1; }
+    if (!edge && j - 30 <= 3 - Math.abs(kk + 4)) c = hex('#1d2147');
+    add(IW + 1, j, kk, edge ? P.cream : c, edge ? 0 : em);
+  }
+
+  // desk: top of two cubes, four legs, a drawer unit on the right
+  for (let i = DESK.i0; i <= DESK.i1; i++) for (let k = DESK.k0; k <= DESK.k1; k++) { add(i, 14, k, P.deskTop); add(i, 13, k, mul(P.deskTop, 0.92)); }
+  for (const [li, lk] of [[DESK.i0, DESK.k0], [DESK.i1 - 1, DESK.k0], [DESK.i0, DESK.k1 - 1], [DESK.i1 - 1, DESK.k1 - 1]])
+    for (let a = 0; a < 2; a++) for (let b = 0; b < 2; b++) for (let j = 0; j < 13; j++) add(li + a, j, lk + b, P.desk);
+  for (let i = 68; i <= 77; i++) for (let k = -7; k <= 3; k++) for (let j = 5; j < 13; j++) add(i, j, k, j === 8 || j === 9 ? mul(P.desk, 1.12) : P.desk);
+  add(72, 9, 4, P.silver); add(73, 9, 4, P.silver);
+  // laptop: base with keys, screen bezel (the display is drawn live)
+  for (let i = LAPTOP.bi0; i <= LAPTOP.bi1; i++) for (let k = LAPTOP.bk0; k <= LAPTOP.bk1; k++) {
+    let c = P.silver;
+    if (k >= -2 && k <= 1 && i > LAPTOP.bi0 && i < LAPTOP.bi1) c = (i + k) & 1 ? hex('#a9b2c2') : hex('#d4dae4');
+    if (k === 3 && i >= 58 && i <= 61) c = P.silverDk;
+    add(i, 15, k, c);
+  }
+  for (let i = LAPTOP.si0; i <= LAPTOP.si1; i++) for (let j = LAPTOP.sj0; j <= LAPTOP.sj1; j++) {
+    const disp = i > LAPTOP.si0 && i < LAPTOP.si1 && j > LAPTOP.sj0 && j < LAPTOP.sj1;
+    if (!disp) add(i, j, LAPTOP.bk0, j === LAPTOP.sj0 ? P.silverDk : hex('#2c3142'));
+  }
+  // lamp on the desk
+  for (let a = 0; a < 2; a++) for (let b = 0; b < 2; b++) add(76 + a, 15, -6 + b, hex('#3c3f4c'));
+  for (let j = 16; j <= 21; j++) add(76, j, -6, hex('#3c3f4c'));
+  for (let a = -1; a <= 1; a++) for (let b = -1; b <= 1; b++) add(76 + a, 23, -6 + b, hex('#ff9a3c'));
+  for (let a = -1; a <= 1; a++) for (let b = -1; b <= 1; b++) if (Math.abs(a) + Math.abs(b) < 3) add(76 + a, 22, -6 + b, hex('#ffb35a'));
+  add(76, 22, -6, hex('#fff1a8'), 1);
+  // plant: orange pot, soil, fronds that arch out and up
+  for (let i = 71; i <= 74; i++) for (let k = 7; k <= 10; k++) for (let j = 0; j < 4; j++) add(i, j, k, j === 3 ? mul(P.pot, 1.12) : P.pot);
+  for (let i = 72; i <= 73; i++) for (let k = 8; k <= 9; k++) add(i, 4, k, hex('#4b3426'));
+  const dirs = [[1, 0], [1, 1], [0, 1], [-1, 1], [-1, 0], [-1, -1], [0, -1], [1, -1]];
+  for (let j = 5; j <= 17; j++) add(72, j, 8, hex('#2f8f46'));
+  dirs.forEach(([dx, dz], d) => {
+    const L = 3 + (d % 3);
+    for (let n = 1; n <= L; n++) for (const dj of [0, 1]) add(72 + dx * n, 7 + Math.floor(n * 0.9) + (d % 2) + dj + (n === L ? 1 : 0), 8 + dz * n, hash(d, n, dj) < 0.3 ? hex('#56c46e') : P.leaf);
+  });
+  for (let n = 1; n <= 3; n++) { add(72, 15 + n, 8, P.leaf); add(73 - 0, 14 + n, 8, hex('#56c46e')); }
+
+  // finish: face colour noise and lamp light on everything that is not a light source
+  for (const c of M.values()) {
+    if (c.e) continue;
+    const x = (c.i + 0.5) * S, hh = (c.j + 0.5) * S, z = (c.k + 0.5) * S;
+    c.c = lampTint(mul(c.c, 0.965 + hash(c.i, c.j, c.k) * 0.07), x, hh, z);
+  }
+  const list = [...M.values()].sort((a, b) => (a.i + a.j + a.k) - (b.i + b.j + b.k));
+  // columns occupied by props, used to keep floor flashes off the desk
+  const cols = new Set();
+  for (const c of list) if (c.j >= 0 && c.k > KW + 1 && c.i > IW + 1) cols.add(colKey(c.i, c.k));
+  return { M, list, cols };
+}
+
+// ---- cube drawing ---------------------------------------------------------------------------------------------
+function cube(ctx, X, Y, Z, sz, c, emis, fT, fL, fR) {
+  const f = sz / S;
+  const qx = CX + (X - Z) * FA * SC, qy = CY + (X + Z) * 0.5 * SC - Y * SC;
+  const ex = EX * f, ey = EY * f, eh = EH * f;
+  const fa = emis ? FE : null;
+  if (fT) {
+    ctx.fillStyle = css(mul(c, fa ? fa[0] : FT)); ctx.beginPath();
+    ctx.moveTo(qx, qy - eh); ctx.lineTo(qx + ex, qy - eh + ey); ctx.lineTo(qx + ex - ex, qy - eh + ey + ey); ctx.lineTo(qx - ex, qy - eh + ey); ctx.closePath(); ctx.fill(); ctx.stroke();
+  }
+  if (fL) {
+    ctx.fillStyle = css(mul(c, fa ? fa[1] : FL)); ctx.beginPath();
+    const lx = qx - ex, ly = qy + ey;
+    ctx.moveTo(lx, ly); ctx.lineTo(qx, qy + ey + ey); ctx.lineTo(qx, qy + ey + ey - eh); ctx.lineTo(lx, ly - eh); ctx.closePath(); ctx.fill(); ctx.stroke();
+  }
+  if (fR) {
+    ctx.fillStyle = css(mul(c, fa ? fa[2] : FR)); ctx.beginPath();
+    const rx = qx + ex, ry = qy + ey;
+    ctx.moveTo(qx, qy + ey + ey); ctx.lineTo(rx, ry); ctx.lineTo(rx, ry - eh); ctx.lineTo(qx, qy + ey + ey - eh); ctx.closePath(); ctx.fill(); ctx.stroke();
+  }
+}
+// Note on the projection: a cube whose lowest-back corner is (X, Y, Z) has its nearest vertical edge at
+// screen (qx, qy + 2 ey). The three faces above are drawn relative to that vertex.
+
+function drawSet(ctx, list, has) {
+  for (const c of list) {
+    const soft = c.k === KW || c.i === IW;
+    ctx.strokeStyle = soft ? 'rgba(8,10,30,0.1)' : 'rgba(8,10,30,0.22)';
+    const fT = !has(c.i, c.j + 1, c.k), fL = !has(c.i, c.j, c.k + 1), fR = !has(c.i + 1, c.j, c.k);
+    if (fT || fL || fR) cube(ctx, c.i * S, c.j * S, c.k * S, S, c.c, c.e, fT, fL, fR);
+  }
+}
+
+const bgCache = new Map();
+function background(w) {
+  let c = bgCache.get(w);
+  if (c) return c;
+  if (!STATIC) STATIC = buildStatic();
+  c = typeof OffscreenCanvas !== 'undefined' ? new OffscreenCanvas(w, w) : Object.assign(document.createElement('canvas'), { width: w, height: w });
+  const g = c.getContext('2d'), k = w / W;
+  g.scale(k, k);
+  // the void around the diorama: deep navy with a soft glow, a few distant cubes
+  const gr = g.createRadialGradient(500, 470, 60, 500, 500, 760);
+  gr.addColorStop(0, '#26264f'); gr.addColorStop(1, '#0b0c20');
+  g.fillStyle = gr; g.fillRect(0, 0, W, H);
+  const r = rng(9);
+  for (let n = 0; n < 46; n++) {
+    const x = r() * W, y = r() * H, s = 2 + r() * 4, col = r() < 0.5 ? '#3a3c78' : '#51407d';
+    if (x > 120 && x < 880 && y > 90 && y < 920 && r() < 0.8) continue;
+    g.fillStyle = col; g.fillRect(x, y, s, s);
+  }
+  // a soft shadow under the diorama and a few cubes floating in the dark
+  const sg = g.createRadialGradient(0, 0, 10, 0, 0, 420);
+  sg.addColorStop(0, 'rgba(0,0,10,0.55)'); sg.addColorStop(1, 'rgba(0,0,10,0)');
+  g.save(); g.translate(500, 905); g.scale(1, 0.3); g.fillStyle = sg; g.fillRect(-500, -420, 1000, 840); g.restore();
+  g.lineJoin = 'round'; g.lineWidth = 0.9; g.strokeStyle = 'rgba(8,10,30,0.22)';
+  const fl = [[860, 120, 18, '#3b3f86'], [930, 230, 11, '#6a4b96'], [790, 60, 9, '#2f3a7c'], [90, 700, 16, '#3b3f86'], [60, 560, 10, '#6a4b96'], [150, 850, 12, '#2f3a7c'], [920, 600, 12, '#2f3a7c'], [960, 90, 8, '#6a4b96']];
+  for (const [fx, fy, fs, fc] of fl) {
+    const e = fs * FA, v = fs * 0.5, c0 = hex(fc);
+    g.fillStyle = css(mul(c0, FT)); g.beginPath(); g.moveTo(fx, fy - fs); g.lineTo(fx + e, fy - fs + v); g.lineTo(fx, fy - fs + 2 * v); g.lineTo(fx - e, fy - fs + v); g.closePath(); g.fill(); g.stroke();
+    g.fillStyle = css(mul(c0, FL)); g.beginPath(); g.moveTo(fx - e, fy + v - fs); g.lineTo(fx, fy + 2 * v - fs); g.lineTo(fx, fy + 2 * v); g.lineTo(fx - e, fy + v); g.closePath(); g.fill(); g.stroke();
+    g.fillStyle = css(mul(c0, FR)); g.beginPath(); g.moveTo(fx, fy + 2 * v - fs); g.lineTo(fx + e, fy + v - fs); g.lineTo(fx + e, fy + v); g.lineTo(fx, fy + 2 * v); g.closePath(); g.fill(); g.stroke();
+  }
+  const { M, list } = STATIC;
+  drawSet(g, list, (i, j, kk) => M.has(key(i, j, kk)));
+  bgCache.set(w, c);
+  return c;
+}
+
+// ---- the figure, voxelised every call --------------------------------------------------------------------------
+const j3 = (j) => ({ x: j.x, h: FLOOR_Y - j.y, z: (j.z || 0) * DIMS.depth });
+
+function voxelise(p, t) {
+  const F = new Map();
+  const put = (i, j, k, c, pr) => {
+    if (j < 0) return;
+    const kk = key(i, j, k), o = F.get(kk);
+    if (!o || o.pr < pr) F.set(kk, { i, j, k, c, pr });
+  };
+  // fill every cube whose centre is inside a swept sphere (a capsule) from A to B; colour comes from colFn
+  const capsule = (A, Bp, r, colFn, pr, zs = 1) => {
+    const minx = Math.min(A.x, Bp.x) - r, maxx = Math.max(A.x, Bp.x) + r, minh = Math.min(A.h, Bp.h) - r, maxh = Math.max(A.h, Bp.h) + r;
+    const minz = Math.min(A.z, Bp.z) - r / zs, maxz = Math.max(A.z, Bp.z) + r / zs;
+    const abx = Bp.x - A.x, abh = Bp.h - A.h, abz = (Bp.z - A.z) * zs, l2 = abx * abx + abh * abh + abz * abz || 1;
+    for (let i = Math.floor(minx / S); i <= Math.floor(maxx / S); i++) for (let j = Math.floor(minh / S); j <= Math.floor(maxh / S); j++) for (let k = Math.floor(minz / S); k <= Math.floor(maxz / S); k++) {
+      const x = (i + 0.5) * S, h = (j + 0.5) * S, z = (k + 0.5) * S;
+      const tt = clamp(((x - A.x) * abx + (h - A.h) * abh + (z - A.z) * zs * abz) / l2, 0, 1);
+      const dx = x - (A.x + abx * tt), dh = h - (A.h + abh * tt), dz = (z - (A.z + (Bp.z - A.z) * tt)) * zs;
+      if (dx * dx + dh * dh + dz * dz <= r * r) { const c = colFn(x, h, z, tt, i, j, k); if (c != null) put(i, j, k, c, pr); }
+    }
+  };
+  const flat = (c) => () => c;
+  const sphere = (C, r, colFn, pr) => capsule(C, C, r, colFn, pr);
+
+  const pel = j3(p.pelvis), neck = j3(p.neck), head = j3(p.head), chest = j3(p.chest);
+  const dx = neck.x - pel.x, dh = neck.h - pel.h, dl = Math.hypot(dx, dh), sx = dx / dl, sh = dh / dl;   // spine direction
+  const fx = sh, fh = -sx;                                                                             // front normal
+  const topNeck = { x: neck.x - sx * 12, h: neck.h - sh * 12, z: 0 };
+
+  // legs: jeans, with a lighter cuff, sneakers with a white sole and an orange toe
+  for (const side of [p.far, p.near]) {
+    const hip = j3(side.hip), knee = j3(side.knee), ank = j3(side.ankle), toe = j3(side.toe);
+    capsule(hip, knee, 13.5, flat(P.jeans), 4);
+    capsule(knee, ank, 11, (x, h, z, tt) => (tt > 0.82 ? P.cuff : P.jeans), 4);
+    const heel = { x: ank.x - 7, h: ank.h - 3, z: ank.z }, tip = { x: toe.x, h: toe.h + 4, z: toe.z };
+    capsule(heel, tip, 8.5, (x, h) => (h < S ? (x > tip.x - 10 ? P.toe : P.sole) : P.upper), 8);
+  }
+  // torso: a hoodie with a hem band, a pocket patch and two white drawstrings; a hood bundle behind the neck
+  capsule(pel, topNeck, 27, (x, h, z, tt) => {
+    const v = (x - pel.x) * fx + (h - pel.h) * fh;
+    if (tt < 0.1) return P.hem;
+    if (tt > 0.62 && tt < 0.95 && v > 14 && Math.abs(z) > 4 && Math.abs(z) < 12) return P.white;
+    if (tt > 0.16 && tt < 0.46 && v > 8) return mul(P.hoodie, 0.88);
+    return P.hoodie;
+  }, 5, 1.08);
+  sphere({ x: neck.x - sx * 0 - fx * 20, h: neck.h - 2, z: 0 }, 17, flat(mul(P.hoodie, 0.9)), 4);
+  // arms: sleeves with darker cuffs, hands in skin
+  const hands = [];
+  for (const side of [p.far, p.near]) {
+    const sh_ = j3(side.shoulder), el = j3(side.elbow), hd = j3(side.hand);
+    capsule(sh_, el, 9.5, flat(P.sleeve), 5);
+    capsule(el, hd, 8.5, (x, h, z, tt) => (tt > 0.78 ? P.hem : P.sleeve), 5);
+    hands.push(hd);
+  }
+  const fist = lerp(8.5, 10.5, p.celebrate);
+  for (const hd of hands) sphere(hd, fist, flat(P.skin), 8);
+  // neck and head
+  capsule(neck, { x: head.x, h: head.h - 20, z: 0 }, 9, flat(P.skin), 6);
+  const a = p.head.angle, fwd = { x: Math.cos(a), h: -Math.sin(a) }, up = { x: Math.sin(a), h: Math.cos(a) };
+  sphere(head, 38, (x, h, z) => {
+    const ddx = x - head.x, ddh = h - head.h, fu = ddx * fwd.x + ddh * fwd.h, uu = ddx * up.x + ddh * up.h;
+    if (uu > 11 || (fu < -12 && uu > -20) || (fu > 8 && uu > 24)) return P.hair;
+    return P.skin;
+  }, 9);
+  const eyeAt = (zz) => { const e = { x: head.x + fwd.x * 31 + up.x * 3, h: head.h + fwd.h * 31 + up.h * 3 }; put(Math.floor(e.x / S), Math.floor(e.h / S), Math.floor(zz / S), P.dark, 10); };
+  eyeAt(-16); eyeAt(16);
+  if (p.celebrate > 0.5) for (const zz of [-6, 6]) { const m = { x: head.x + fwd.x * 33 + up.x * -13, h: head.h + fwd.h * 33 + up.h * -13 }; put(Math.floor(m.x / S), Math.floor(m.h / S), Math.floor(zz / S), hex('#7a2230'), 10); }
+  // headphones around the neck: a dark band and two teal cups
+  const bandH = neck.h - 8;
+  for (let i = Math.floor((neck.x - 44) / S); i <= Math.floor((neck.x + 44) / S); i++) for (let j = Math.floor((bandH - 8) / S); j <= Math.floor((bandH + 8) / S); j++) for (let k = -4; k <= 3; k++) {
+    const x = (i + 0.5) * S - neck.x, h = (j + 0.5) * S, z = (k + 0.5) * S, q = (x / 35) ** 2 + (z / 33) ** 2, q2 = (x / 27) ** 2 + (z / 26) ** 2;
+    if (q <= 1 && q2 > 1 && Math.abs(h - bandH) <= 6) put(i, j, k, P.phone, 7);
+  }
+  for (const zz of [-33, 33]) sphere({ x: neck.x + 12, h: bandH - 8, z: zz }, 10.5, flat(P.cup), 7);
+  return F;
+}
+
+// ---- the display on the laptop: 28 x 22 small cubes -------------------------------------------------------------
+const FONT = { S: ['111', '100', '111', '001', '111'], H: ['101', '101', '111', '101', '101'], I: ['111', '010', '010', '010', '111'], P: ['111', '101', '111', '100', '100'], E: ['111', '100', '111', '100', '111'], D: ['110', '101', '101', '101', '110'] };
+const CHECK = ['.........##', '........###', '.......###.', '##....###..', '###..###...', '.#######...', '..#####....', '...###.....'];
+function displayGrid(t, s) {
+  const cols = 28, rows = 22, g = [];
+  const sg = s.screen;
+  const off = hex('#090d1f'), on = hex('#12204a');
+  const base = mix(off, on, clamp(sg.awake * 1.2, 0, 1));
+  for (let r = 0; r < rows; r++) { g.push(new Array(cols).fill(base)); }
+  const set = (c, r, col) => { if (c >= 0 && c < cols && r >= 0 && r < rows) g[r][c] = col; };
+  if (sg.awake > 0.5) {
+    for (let c = 0; c < cols; c++) { set(c, 0, hex('#1d2f66')); set(c, 1, hex('#1d2f66')); }
+    [[2, '#ff5f6d'], [5, '#ffc857'], [8, '#4ade80']].forEach(([c, col]) => { set(c, 0, hex(col)); set(c, 1, hex(col)); set(c + 1, 0, hex(col)); set(c + 1, 1, hex(col)); });
+  }
+  const pal = ['#ffc857', '#7aa2ff', '#7ee787', '#ff9a6b', '#c792ea'].map(hex);
+  let last = -1;
+  sg.rows.forEach((row, i) => {
+    const r0 = 4 + i * 3, ind = Math.round(row.indent * 18), L = Math.round(row.w * row.len * 24);
+    for (let c = 0; c < L; c++) if (c % 6 !== 5) { set(1 + ind + c, r0, pal[(Math.floor(c / 6) + i) % 5]); set(1 + ind + c, r0 + 1, pal[(Math.floor(c / 6) + i) % 5]); }
+    if (row.len > 0) last = i;
+  });
+  const blink = Math.floor(t / 0.2) % 2 === 0;
+  if (sg.awake > 0.7 && blink && sg.ship < 0.5) { const i = Math.max(last, 0), row = sg.rows[i], ind = Math.round(row.indent * 18), L = Math.round(row.w * row.len * 24); set(1 + ind + L, 4 + i * 3, hex('#ffffff')); set(1 + ind + L, 5 + i * 3, hex('#ffffff')); set(2 + ind + L, 4 + i * 3, hex('#ffffff')); set(2 + ind + L, 5 + i * 3, hex('#ffffff')); }
+  if (sg.ship > 0) {
+    const flash = clamp(1 - (t - 2.8) / 0.32, 0, 1) * (Math.floor((t - 2.8) / 0.06) % 2 === 0 ? 1 : 0.35);
+    const bg = mix(mix(on, P.green, clamp(sg.ship * 1.6, 0, 1)), P.white, flash * 0.55);
+    for (let r = 0; r < rows; r++) for (let c = 0; c < cols; c++) g[r][c] = bg;
+    const ink = P.white, ph = sg.ship > 0.6;
+    if (ph) {
+      CHECK.forEach((line, r) => { for (let c = 0; c < line.length; c++) if (line[c] === '#') set(8 + c, 3 + r, ink); });
+      'SHIPPED'.split('').forEach((ch, n) => FONT[ch].forEach((line, r) => { for (let c = 0; c < 3; c++) if (line[c] === '1') set(n * 4 + c, 13 + r, ink); }));
+      for (let c = 3; c < 25; c++) set(c, 20, mul(P.green, 1.25));
+    }
+  }
+  return g;
+}
+
+function drawDisplay(ctx, g) {
+  const x0 = (LAPTOP.si0 + 1) * S, hTop = (LAPTOP.sj1) * S, z0 = LAPTOP.bk0 * S + 6;
+  for (let r = 0; r < 22; r++) for (let c = 0; c < 28; c++) {
+    const col = g[r][c];
+    cube(ctx, x0 + c * 6, hTop - (r + 1) * 6, z0, 6, col, 1, r === 0, true, c === 27);
+  }
+}
+
+// ---- main ------------------------------------------------------------------------------------------------------
+export function render(ctx, t, w, h) {
+  const k = w / W;
+  if (!STATIC) STATIC = buildStatic();
+  const p = pose(t), s = story(t);
+  ctx.save();
+  ctx.scale(k, k);
+  ctx.drawImage(background(w), 0, 0, W, H);
+  ctx.lineJoin = 'round'; ctx.lineWidth = 0.9; ctx.strokeStyle = 'rgba(8,10,30,0.22)';
+
+  const proj = (X, Y, Z) => [CX + (X - Z) * FA * SC, CY + (X + Z) * 0.5 * SC - Y * SC];
+  const tile = (i, kk, y = 0) => { const [x, yy] = proj(i * S, y, kk * S); return [x, yy, x + EX, yy + EY, x + EX - EX, yy + EY + EY, x - EX, yy + EY]; };
+
+  // the figure
+  const F = voxelise(p, t);
+  const items = [...F.values()];
+  // soft shadow of the figure on the floor, thrown a little to the left
+  const sh = new Set();
+  for (const c of items) sh.add(colKey(c.i - Math.floor(c.j * 0.3), c.k));
+  ctx.fillStyle = 'rgba(10,8,30,0.3)'; ctx.beginPath();
+  for (const kk of sh) {
+    if (STATIC.cols.has(kk)) continue;
+    const i = Math.floor(kk / 64) - 64, kz = (kk % 64) - 32;
+    const [a, b, c1, d, e, f, g1, h1] = tile(i, kz);
+    ctx.moveTo(a, b - 0); ctx.lineTo(c1, d); ctx.lineTo(e, f); ctx.lineTo(g1, h1); ctx.closePath();
+  }
+  ctx.fill();
+  // ship: a ring of light runs across the floor tiles
+  const age = t - 2.8;
+  if (age > 0 && age < 0.8) {
+    const e = age / 0.8, rad = 40 + e * 520;
+    ctx.fillStyle = `rgba(255,236,170,${0.34 * (1 - e)})`; ctx.beginPath();
+    const ci = 60, ck = -1;
+    for (let i = IW + 1; i <= 83; i++) for (let kk = KW + 1; kk <= 10; kk++) {
+      if (STATIC.cols.has(colKey(i, kk))) continue;
+      const d = Math.hypot((i - ci) * S, (kk - ck) * S);
+      if (Math.abs(d - rad) < 22) { const [a, b, c1, d1, e1, f, g1, h1] = tile(i, kk); ctx.moveTo(a, b); ctx.lineTo(c1, d1); ctx.lineTo(e1, f); ctx.lineTo(g1, h1); ctx.closePath(); }
+    }
+    ctx.fill();
+  }
+
+  // clock hands: a few cubes in front of the clock face
+  const cc = LAYOUT.clock, chh = FLOOR_Y - cc.y;
+  const hand = (deg, len, col) => { const a = deg * Math.PI / 180; for (let q = 0; q * 5 <= len; q++) cube(ctx, cc.x + Math.sin(a) * q * 5 - 2.5, chh + Math.cos(a) * q * 5 - 2.5, (KW + 2) * S, 5, col, 0, true, true, true); };
+  hand(305 + t * 0.5, 22, hex('#2b2f4a'));
+  hand(60 + t * 6, 32, hex('#2b2f4a'));
+  hand(Math.floor(t / 0.4) * 30, 34, hex('#e5483a'));
+
+  drawDisplay(ctx, displayGrid(t, s));
+
+  // figure cubes, far to near
+  items.sort((a, b) => (a.i + a.j + a.k) - (b.i + b.j + b.k));
+  const has = (i, j, kk) => F.has(key(i, j, kk)) || STATIC.M.has(key(i, j, kk));
+  const lit = (c, x, hh, z) => lampTint(c, x, hh, z);
+  for (const c of items) {
+    const fT = !has(c.i, c.j + 1, c.k), fL = !has(c.i, c.j, c.k + 1), fR = !has(c.i + 1, c.j, c.k);
+    if (fT || fL || fR) cube(ctx, c.i * S, c.j * S, c.k * S, S, lit(c.c, (c.i + 0.5) * S, (c.j + 0.5) * S, (c.k + 0.5) * S), 0, fT, fL, fR);
+  }
+
+  // confetti: small floating cubes
+  const cols = ['#ff4f6d', '#ffd23f', '#3ddc97', '#4cc9f0', '#ffffff'].map(hex);
+  const conf = particles(t, 48).map((q) => ({ q, X: q.x, Y: FLOOR_Y - q.y, Z: -10 + (((q.i * 7) % 9) - 4) * 14 })).sort((a, b) => (a.X + a.Y + a.Z) - (b.X + b.Y + b.Z));
+  for (const { q, X, Y, Z } of conf) {
+    ctx.globalAlpha = q.alpha;
+    const sz = 7 + q.size * 0.5;
+    cube(ctx, X, Y, Z, sz, cols[q.i % 5], 1, true, true, true);
+  }
+  ctx.globalAlpha = 1;
+  ctx.restore();
+}

@@ -1,0 +1,548 @@
+// 07 ps1: a tiny software 3D renderer in the spirit of a 1997 console. A real perspective camera, Gouraud lit
+// triangles with per-vertex fog, affine (not perspective-correct) textures, vertex positions snapped to a 160 x 160
+// grid so edges crawl, 5-bit colour with a 4x4 ordered dither, then scaled up with nearest neighbour.
+import { W, H, LAYOUT, DIMS, pose, story, particles, util, rng } from '../rig.js';
+
+export const meta = { id: '07', slug: 'ps1', name: 'PS1 Low-Poly', tag: '1997 console', accent: '#8bd34e' };
+
+const { clamp, lerp, smooth } = util;
+const R = 160;                                   // framebuffer is R x R
+const FOG = [32, 26, 48];                        // dark purple, the colour distance fades to
+
+// ---- tiny vector helpers ----------------------------------------------------------------------------------
+const add = (a, b) => [a[0] + b[0], a[1] + b[1], a[2] + b[2]];
+const sub = (a, b) => [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
+const mul = (a, k) => [a[0] * k, a[1] * k, a[2] * k];
+const dot = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+const cross = (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+const len = (a) => Math.hypot(a[0], a[1], a[2]);
+const norm = (a) => { const l = len(a) || 1; return [a[0] / l, a[1] / l, a[2] / l]; };
+const comb = (c, ...pairs) => { let o = c.slice(); for (let i = 0; i < pairs.length; i += 2) { o = add(o, mul(pairs[i], pairs[i + 1])); } return o; };
+
+// ---- textures: built once, deterministic -------------------------------------------------------------------
+function tex(w, h, fn) {
+  const d = new Uint8ClampedArray(w * h * 4);
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) { const c = fn(x, y); const i = (y * w + x) * 4; d[i] = c[0]; d[i + 1] = c[1]; d[i + 2] = c[2]; d[i + 3] = 255; }
+  return { w, h, d };
+}
+const jit = (c, n, r) => { const k = (r() - 0.5) * n; return [c[0] + k, c[1] + k, c[2] + k]; };
+const TEX = (() => {
+  const r = rng(1997), T = {};
+  T.floor = tex(32, 32, (x, y) => { const a = ((x >> 4) + (y >> 4)) & 1; const g = (x % 16 === 0 || y % 16 === 0) ? 0.8 : 1; return jit(a ? [74, 62, 96] : [48, 42, 68], 9, r).map((v) => v * g); });
+  T.wall = tex(32, 32, (x, y) => {
+    let c = (x >> 2) & 1 ? [92, 118, 98] : [80, 104, 88];
+    const dx = Math.abs((x % 16) - 8), dy = Math.abs((y % 16) - 8);
+    if (dx + dy < 4) c = [112, 136, 108];
+    if (dx + dy === 4) c = [66, 88, 74];
+    return jit(c, 7, r);
+  });
+  T.wood = tex(16, 16, (x, y) => jit((y % 5 === 0) ? [86, 58, 38] : [124, 88, 58], 8, r));
+  T.rug = tex(32, 24, (x, y) => {
+    const b = Math.min(x, y, 31 - x, 23 - y);
+    if (b < 2) return [196, 164, 96];
+    if (b < 4) return [96, 30, 44];
+    if (b === 4) return [196, 164, 96];
+    const d = Math.abs(x - 16) + Math.abs(y - 12);
+    if (d % 6 < 2) return jit([196, 150, 80], 8, r);
+    return jit([130, 40, 58], 10, r);
+  });
+  const S = [232, 180, 148], DK = [34, 22, 28], RD = [160, 60, 64], WH = [244, 244, 240];
+  const face = (kind) => {
+    const px = new Map();
+    const set = (x, y, c) => px.set(x + ',' + y, c);
+    if (kind === 'blink') { for (let x = 2; x < 6; x++) { set(x, 7, DK); set(x + 8, 7, DK); } }
+    else if (kind === 'grin') {
+      for (const ox of [2, 10]) { set(ox, 7, DK); set(ox + 1, 6, DK); set(ox + 2, 6, DK); set(ox + 3, 7, DK); }
+      for (let x = 4; x < 12; x++) { set(x, 10, DK); set(x, 11, WH); }
+      for (let x = 5; x < 11; x++) { set(x, 12, RD); set(x, 13, RD); }
+      set(4, 11, DK); set(11, 11, DK);
+      set(2, 10, [236, 140, 130]); set(13, 10, [236, 140, 130]);
+    } else {
+      for (let y = 6; y < 9; y++) for (const ox of [3, 11]) { set(ox, y, DK); set(ox + 1, y, DK); }
+      for (const ox of [3, 11]) set(ox, 6, WH);
+      for (let x = 2; x < 6; x++) { set(x, 4, DK); set(x + 8, 4, DK); }
+      set(7, 10, [208, 148, 118]); set(8, 10, [208, 148, 118]);
+      for (let x = 6; x < 10; x++) set(x, 12, RD);
+    }
+    return tex(16, 16, (x, y) => px.get(x + ',' + y) || S);
+  };
+  T.faceN = face('neutral'); T.faceG = face('grin'); T.faceB = face('blink');
+  T.window = tex(64, 96, (x, y) => {
+    const t = y / 96, sky = [lerp(10, 64, t * t), lerp(12, 26, t), lerp(40, 82, t)];
+    const q = ((x & 3) + (y & 3) * 4) / 16;                                   // dithered sky bands
+    const base = [Math.floor(sky[0] / 6 + q * 0.9) * 6, Math.floor(sky[1] / 6 + q * 0.9) * 6, Math.floor(sky[2] / 6 + q * 0.9) * 6];
+    return base;
+  });
+  {
+    const d = T.window.d, set = (x, y, c) => { if (x < 0 || y < 0 || x >= 64 || y >= 96) return; const i = (y * 64 + x) * 4; d[i] = c[0]; d[i + 1] = c[1]; d[i + 2] = c[2]; };
+    for (let i = 0; i < 26; i++) set(Math.floor(r() * 64), Math.floor(r() * 50), [200, 210, 255]);
+    for (let y = -10; y <= 10; y++) for (let x = -10; x <= 10; x++) {            // crescent moon
+      if (x * x + y * y <= 81 && (x - 3) * (x - 3) + (y + 2) * (y + 2) > 64) set(46 + x, 22 + y, [246, 240, 190]);
+    }
+    for (let layer = 0; layer < 2; layer++) {
+      let bx = -2;
+      while (bx < 64) {
+        const bw = 6 + Math.floor(r() * 6), bh = (layer ? 14 : 26) + Math.floor(r() * (layer ? 14 : 20)), top = 96 - bh;
+        for (let y = top; y < 96; y++) for (let x = bx; x < bx + bw; x++) set(x, y, layer ? [18, 14, 38] : [34, 24, 62]);
+        for (let y = top + 3; y < 94; y += 4) for (let x = bx + 1; x < bx + bw - 1; x += 3) if (r() < (layer ? 0.5 : 0.3)) set(x, y, layer ? [255, 224, 120] : [150, 130, 120]);
+        bx += bw + 1;
+      }
+    }
+  }
+  T.picture = tex(16, 12, (x, y) => {
+    if (y < 7) return (x + y) % 5 === 0 ? [196, 170, 220] : [128, 90, 170];
+    const h = 7 + Math.round(2 * Math.sin(x * 0.6));
+    return y >= h ? jit([48, 94, 56], 10, r) : [128, 90, 170];
+  });
+  T.keys = null;
+  return T;
+})();
+
+const BAYER = [0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5];
+
+// ---- 5x7 pixel font ----------------------------------------------------------------------------------------
+const FONT = {
+  S: ['.####', '#....', '#....', '.###.', '....#', '....#', '####.'],
+  H: ['#...#', '#...#', '#...#', '#####', '#...#', '#...#', '#...#'],
+  I: ['#####', '..#..', '..#..', '..#..', '..#..', '..#..', '#####'],
+  P: ['####.', '#...#', '#...#', '####.', '#....', '#....', '#....'],
+  E: ['#####', '#....', '#....', '####.', '#....', '#....', '#####'],
+  D: ['####.', '#...#', '#...#', '#...#', '#...#', '#...#', '####.'],
+  A: ['.###.', '#...#', '#...#', '#####', '#...#', '#...#', '#...#'],
+  V: ['#...#', '#...#', '#...#', '#...#', '#...#', '.#.#.', '..#..'],
+  N: ['#...#', '##..#', '##..#', '#.#.#', '#..##', '#..##', '#...#'],
+  G: ['.####', '#....', '#....', '#.###', '#...#', '#...#', '.###.'],
+  '.': ['.....', '.....', '.....', '.....', '.....', '..#..', '..#..'],
+};
+function drawText(put, str, x0, y0, sc, col) {
+  let x = x0;
+  for (const ch of str) {
+    const g = FONT[ch]; if (!g) { x += 6 * sc; continue; }
+    for (let y = 0; y < 7; y++) for (let xx = 0; xx < 5; xx++) if (g[y][xx] === '#') put(x + xx * sc, y0 + y * sc, sc, sc, col);
+    x += 6 * sc;
+  }
+}
+
+// ---- the frame buffer -----------------------------------------------------------------------------------------
+const FB = { cv: null, ctx: null, img: null, z: new Float32Array(R * R) };
+function fbInit() {
+  if (FB.cv) return;
+  const cv = typeof document !== 'undefined' ? document.createElement('canvas') : new OffscreenCanvas(R, R);
+  cv.width = R; cv.height = R;
+  FB.cv = cv; FB.ctx = cv.getContext('2d'); FB.img = FB.ctx.createImageData(R, R);
+}
+
+// ---- camera: slightly high, slightly off axis, fixed ------------------------------------------------------------
+const EYE = [690, 610, 880], TGT = [500, 330, -60];
+const FWD = norm(sub(TGT, EYE)), RIGHT = norm(cross(FWD, [0, 1, 0])), CUP = cross(RIGHT, FWD);
+const FOCAL = (R / 2) / Math.tan(29 * Math.PI / 180);
+
+// ---- triangle list ------------------------------------------------------------------------------------------------
+let TR = [];
+function emit(a, b, c, na, nb, nc, o) { TR.push({ p: [a, b, c], n: [na, nb, nc], o }); }
+function quad(a, b, c, d, n, o) {
+  const uv = o.uv4;
+  emit(a, b, c, n, n, n, uv ? { ...o, uv: [uv[0], uv[1], uv[2]] } : o);
+  emit(a, c, d, n, n, n, uv ? { ...o, uv: [uv[0], uv[2], uv[3]] } : o);
+}
+function quadN(a, b, c, d, na, nb, nc, nd, o) {
+  const cl = o.cols;
+  emit(a, b, c, na, nb, nc, cl ? { ...o, cols: [cl[0], cl[1], cl[2]] } : o);
+  emit(a, c, d, na, nc, nd, cl ? { ...o, cols: [cl[0], cl[2], cl[3]] } : o);
+}
+const FACES = [
+  [[1, -1, 1], [1, -1, -1], [1, 1, -1], [1, 1, 1]],       // +x (forward)
+  [[-1, -1, -1], [-1, -1, 1], [-1, 1, 1], [-1, 1, -1]],   // -x
+  [[-1, 1, 1], [1, 1, 1], [1, 1, -1], [-1, 1, -1]],       // +y (top)
+  [[-1, -1, -1], [1, -1, -1], [1, -1, 1], [-1, -1, 1]],   // -y
+  [[-1, -1, 1], [1, -1, 1], [1, 1, 1], [-1, 1, 1]],       // +z (near side)
+  [[1, -1, -1], [-1, -1, -1], [-1, 1, -1], [1, 1, -1]],   // -z
+];
+// oriented box, optionally tapered (top = [sx, sz] scale on the +y side). o.faces[i] overrides a single face.
+function obox(c, ex, ey, ez, hx, hy, hz, o = {}) {
+  const top = o.top || [1, 1];
+  const P = (s) => {
+    const k = s[1] > 0 ? 1 : 0, tx = k ? top[0] : 1, tz = k ? top[1] : 1;
+    return [c[0] + ex[0] * hx * tx * s[0] + ey[0] * hy * s[1] + ez[0] * hz * tz * s[2], c[1] + ex[1] * hx * tx * s[0] + ey[1] * hy * s[1] + ez[1] * hz * tz * s[2], c[2] + ex[2] * hx * tx * s[0] + ey[2] * hy * s[1] + ez[2] * hz * tz * s[2]];
+  };
+  FACES.forEach((f, i) => {
+    const q = f.map(P), fo = (o.faces && o.faces[i]) || null;
+    let n = norm(cross(sub(q[1], q[0]), sub(q[3], q[0])));
+    const cen = mul(add(add(q[0], q[1]), add(q[2], q[3])), 0.25);
+    if (dot(n, sub(cen, c)) < 0) n = mul(n, -1);
+    const oo = fo ? { ...o, ...fo } : o;
+    if (oo.tex && !oo.uv4) { const tw = oo.tex.w * (oo.ru || 1), th = oo.tex.h * (oo.rv || 1); oo.uv4 = [[0, th], [tw, th], [tw, 0], [0, 0]]; }
+    quad(q[0], q[1], q[2], q[3], n, oo);
+  });
+}
+function axisBox(c, hx, hy, hz, o) { obox(c, [1, 0, 0], [0, 1, 0], [0, 0, 1], hx, hy, hz, o); }
+// hex (or n-sided) prism from A to B, smooth radial normals so it Gouraud shades
+function prism(A, B, rA, rB, o = {}) {
+  const n = o.sides || 6, d = norm(sub(B, A)), ref = o.ref || [0, 0, 1];
+  let e1 = cross(d, ref); if (len(e1) < 1e-3) e1 = cross(d, [1, 0, 0]);
+  e1 = norm(e1); const e2 = cross(d, e1);
+  const ring = [], nr = [];
+  for (let k = 0; k < n; k++) { const a = (k + 0.5) / n * Math.PI * 2, rd = add(mul(e1, Math.cos(a)), mul(e2, Math.sin(a))); nr.push(rd); ring.push(rd); }
+  const ca = o.colA || o.col, cb = o.colB || o.col;
+  for (let k = 0; k < n; k++) {
+    const k2 = (k + 1) % n;
+    quadN(add(A, mul(ring[k], rA)), add(A, mul(ring[k2], rA)), add(B, mul(ring[k2], rB)), add(B, mul(ring[k], rB)), nr[k], nr[k2], nr[k2], nr[k], { ...o, cols: [ca, ca, cb, cb] });
+    if (o.capA !== false) emit(A, add(A, mul(ring[k2], rA)), add(A, mul(ring[k], rA)), mul(d, -1), mul(d, -1), mul(d, -1), { ...o, col: ca });
+    if (o.capB !== false) emit(B, add(B, mul(ring[k], rB)), add(B, mul(ring[k2], rB)), d, d, d, { ...o, col: cb });
+  }
+}
+// flat fan (disc) facing n
+function disc(c, n, ex, ey, rx, ry, segs, o) {
+  for (let k = 0; k < segs; k++) {
+    const a0 = k / segs * Math.PI * 2, a1 = (k + 1) / segs * Math.PI * 2;
+    emit(c, add(c, add(mul(ex, Math.cos(a0) * rx), mul(ey, Math.sin(a0) * ry))), add(c, add(mul(ex, Math.cos(a1) * rx), mul(ey, Math.sin(a1) * ry))), n, n, n, o);
+  }
+}
+// a tessellated plane: PS1 games cut big surfaces into cells so vertex lighting and fog have something to interpolate
+function grid(O, U, V, nu, nv, n, o, uvScale) {
+  for (let j = 0; j < nv; j++) for (let i = 0; i < nu; i++) {
+    const p = (a, b) => comb(O, U, a / nu, V, b / nv);
+    const uv = uvScale ? [[(i) * uvScale[0], (j) * uvScale[1]], [(i + 1) * uvScale[0], j * uvScale[1]], [(i + 1) * uvScale[0], (j + 1) * uvScale[1]], [i * uvScale[0], (j + 1) * uvScale[1]]] : null;
+    quad(p(i, j), p(i + 1, j), p(i + 1, j + 1), p(i, j + 1), n, { ...o, uv4: uv });
+  }
+}
+
+// ---- lights (vertex lighting only) -------------------------------------------------------------------------------
+let LIGHTS = [];
+const AMB = [0.5, 0.47, 0.62];
+const SUN = norm([0.25, 0.9, 0.55]), SUNC = [0.32, 0.30, 0.26];
+function shadeVertex(P, N, two) {
+  let r = AMB[0], g = AMB[1], b = AMB[2];
+  let dn = dot(N, SUN); dn = two ? Math.abs(dn) : Math.max(0, dn);
+  r += SUNC[0] * dn; g += SUNC[1] * dn; b += SUNC[2] * dn;
+  for (const L of LIGHTS) {
+    const d = sub(L.p, P), dist = len(d);
+    if (dist >= L.r) continue;
+    let nl = dot(N, d) / (dist || 1); nl = two ? Math.abs(nl) : Math.max(0, nl);
+    const k = (1 - dist / L.r) * (1 - dist / L.r) * nl * L.k;
+    r += L.c[0] * k; g += L.c[1] * k; b += L.c[2] * k;
+  }
+  return [Math.min(r, 1.6), Math.min(g, 1.6), Math.min(b, 1.6)];
+}
+
+// ---- rasteriser --------------------------------------------------------------------------------------------------------
+function rasterTri(fb, zb, A, B, C, tx, shadow) {
+  let area = (B.x - A.x) * (C.y - A.y) - (B.y - A.y) * (C.x - A.x);
+  if (area === 0) return;
+  if (area < 0) { const s = B; B = C; C = s; area = -area; }
+  const x0 = Math.max(0, Math.min(A.x, B.x, C.x)), x1 = Math.min(R - 1, Math.max(A.x, B.x, C.x));
+  const y0 = Math.max(0, Math.min(A.y, B.y, C.y)), y1 = Math.min(R - 1, Math.max(A.y, B.y, C.y));
+  const ia = 1 / area;
+  for (let y = y0; y <= y1; y++) {
+    const py = y + 0.5;
+    for (let x = x0; x <= x1; x++) {
+      const px = x + 0.5;
+      const w0 = (B.x - px) * (C.y - py) - (B.y - py) * (C.x - px);
+      const w1 = (C.x - px) * (A.y - py) - (C.y - py) * (A.x - px);
+      const w2 = (A.x - px) * (B.y - py) - (A.y - py) * (B.x - px);
+      if (w0 < 0 || w1 < 0 || w2 < 0) continue;
+      const l0 = w0 * ia, l1 = w1 * ia, l2 = w2 * ia;
+      const z = 1 / (l0 * A.iz + l1 * B.iz + l2 * C.iz), zi = y * R + x;
+      const i4 = zi * 4;
+      if (shadow !== undefined) { if (z > zb[zi] + 6) continue; fb[i4] *= shadow; fb[i4 + 1] *= shadow; fb[i4 + 2] *= shadow; continue; }
+      if (z >= zb[zi]) continue;
+      zb[zi] = z;
+      const f = l0 * A.f + l1 * B.f + l2 * C.f, k = 1 - f;
+      let r, g, b;
+      if (tx) {
+        let u = Math.floor(l0 * A.u + l1 * B.u + l2 * C.u) % tx.w, v = Math.floor(l0 * A.v + l1 * B.v + l2 * C.v) % tx.h; if (u < 0) u += tx.w; if (v < 0) v += tx.h; const ti = (v * tx.w + u) * 4;
+        r = tx.d[ti]; g = tx.d[ti + 1]; b = tx.d[ti + 2];
+      } else { r = l0 * A.cr + l1 * B.cr + l2 * C.cr; g = l0 * A.cg + l1 * B.cg + l2 * C.cg; b = l0 * A.cb + l1 * B.cb + l2 * C.cb; }
+      const lr = l0 * A.lr + l1 * B.lr + l2 * C.lr, lg = l0 * A.lg + l1 * B.lg + l2 * C.lg, lb = l0 * A.lb + l1 * B.lb + l2 * C.lb;
+      fb[i4] = r * lr * k + FOG[0] * f; fb[i4 + 1] = g * lg * k + FOG[1] * f; fb[i4 + 2] = b * lb * k + FOG[2] * f;
+    }
+  }
+}
+
+function project(P, N, o, idx) {
+  const d = sub(P, EYE), x = dot(d, RIGHT), y = dot(d, CUP), z = dot(d, FWD);
+  const v = { x: Math.round(R / 2 + FOCAL * x / z), y: Math.round(R / 2 - FOCAL * y / z), z };
+  if (o.unlit) { v.lr = v.lg = v.lb = o.unlit; } else { const L = shadeVertex(P, N, o.two); v.lr = L[0]; v.lg = L[1]; v.lb = L[2]; }
+  v.f = o.nofog ? 0 : clamp((z - 800) / 1500, 0, 0.74);
+  if (o.bias) v.z -= o.bias;
+  v.iz = 1 / v.z;
+  if (o.tex) { const uv = o.uv[idx]; v.u = uv[0]; v.v = uv[1]; }
+  else { const c = o.cols ? o.cols[idx] : o.col; v.cr = c[0]; v.cg = c[1]; v.cb = c[2]; }
+  return v;
+}
+
+// ---- the scene -----------------------------------------------------------------------------------------------------------
+const W3 = (j) => [j.x, 800 - j.y, (j.z || 0) * DIMS.depth];
+const X = [1, 0, 0], Y = [0, 1, 0], Z = [0, 0, 1];
+const WALLZ = -260, LEFTX = -120, RIGHTX = 1160, CEIL = 740;
+const COL = {
+  hood: [182, 74, 52], hoodD: [146, 54, 40], hoodL: [206, 98, 72], jeans: [62, 84, 156], jeansD: [50, 68, 132], skin: [232, 180, 148], skinD: [212, 150, 120],
+  hair: [52, 36, 30], hairL: [72, 52, 40], shoe: [228, 228, 238], sole: [60, 56, 70], red: [196, 52, 52], phone: [236, 198, 58], phoneD: [58, 56, 64],
+  wood: [124, 88, 58], woodD: [96, 66, 42], silver: [158, 162, 176], silverD: [110, 114, 128], leafD: [30, 92, 48], leafL: [110, 190, 80], pot: [176, 94, 62],
+};
+
+function buildRoom(t, st, p) {
+  const ship = st.screen.ship, age = st.shipAge;
+  // floor, walls, ceiling
+  grid([LEFTX, 0, WALLZ], [RIGHTX - LEFTX, 0, 0], [0, 0, 800], 8, 5, Y, { tex: TEX.floor }, [32 / 200 * 160, 32 / 200 * 160]);
+  grid([LEFTX, 180, WALLZ], [RIGHTX - LEFTX, 0, 0], [0, CEIL - 180, 0], 12, 4, Z, { tex: TEX.wall }, [32 / 160 * 106.7, 32 / 160 * 140]);
+  grid([LEFTX, 0, WALLZ], [RIGHTX - LEFTX, 0, 0], [0, 180, 0], 12, 2, Z, { tex: TEX.wood }, [16 / 120 * 106.7, 16 / 120 * 90]);
+  grid([LEFTX, 180, WALLZ], [0, 0, 800], [0, CEIL - 180, 0], 6, 4, X, { tex: TEX.wall }, [32 / 160 * 133, 32 / 160 * 140]);
+  grid([LEFTX, 0, WALLZ], [0, 0, 800], [0, 180, 0], 6, 2, X, { tex: TEX.wood }, [16 / 120 * 133, 16 / 120 * 90]);
+  grid([RIGHTX, 180, WALLZ], [0, 0, 800], [0, CEIL - 180, 0], 6, 4, mul(X, -1), { tex: TEX.wall }, [32 / 160 * 133, 32 / 160 * 140]);
+  grid([LEFTX, CEIL, WALLZ], [RIGHTX - LEFTX, 0, 0], [0, 0, 800], 8, 4, mul(Y, -1), { col: [40, 34, 52] });
+  // chair rail and skirting
+  axisBox([RIGHTX / 2 + LEFTX / 2, 183, WALLZ + 5], (RIGHTX - LEFTX) / 2, 4, 5, { col: COL.woodD });
+  axisBox([LEFTX + 5, 183, WALLZ / 2 + 270], 5, 4, 530, { col: COL.woodD });
+  // rug
+  quad([180, 1.5, -90], [700, 1.5, -90], [700, 1.5, 210], [180, 1.5, 210], Y, { tex: TEX.rug, bias: 30, uv4: [[0, 0], [32, 0], [32, 24], [0, 24]] });
+  // doorway in the left wall: the walker comes in through it
+  axisBox([LEFTX + 3, 205, -10], 4, 205, 62, { col: [8, 6, 14], nofog: false });
+  axisBox([LEFTX + 6, 415, -10], 6, 8, 74, { col: COL.woodD });
+  axisBox([LEFTX + 6, 205, -78], 6, 205, 8, { col: COL.woodD });
+  axisBox([LEFTX + 6, 205, 58], 6, 205, 8, { col: COL.woodD });
+
+  // window: glass billboard, frame, mullions, sill
+  const wn = LAYOUT.window, wx0 = wn.x, wx1 = wn.x + wn.w, wy0 = 800 - wn.y - wn.h, wy1 = 800 - wn.y, wz = WALLZ + 1;
+  quad([wx0, wy0, wz], [wx1, wy0, wz], [wx1, wy1, wz], [wx0, wy1, wz], Z, { tex: TEX.window, bias: 14, unlit: 1.12, uv4: [[0, 96], [64, 96], [64, 0], [0, 0]] });
+  const fr = COL.woodD, fz = WALLZ + 10;
+  axisBox([(wx0 + wx1) / 2, wy1 + 6, fz], wn.w / 2 + 16, 12, 10, { col: fr });
+  axisBox([(wx0 + wx1) / 2, wy0 - 6, fz], wn.w / 2 + 16, 12, 10, { col: fr });
+  axisBox([wx0 - 6, (wy0 + wy1) / 2, fz], 12, wn.h / 2 + 16, 10, { col: fr });
+  axisBox([wx1 + 6, (wy0 + wy1) / 2, fz], 12, wn.h / 2 + 16, 10, { col: fr });
+  axisBox([(wx0 + wx1) / 2, (wy0 + wy1) / 2, fz], 4, wn.h / 2, 5, { col: fr });
+  axisBox([(wx0 + wx1) / 2, wy0 + 160, fz], wn.w / 2, 4, 5, { col: fr });
+  axisBox([(wx0 + wx1) / 2, wy0 - 14, fz + 12], wn.w / 2 + 22, 5, 14, { col: COL.wood });
+
+  // wall clock
+  const ck = LAYOUT.clock, cc = [ck.x, 800 - ck.y, WALLZ + 8];
+  prism(add(cc, [0, 0, 0]), add(cc, [0, 0, 8]), 46, 46, { sides: 12, ref: X, col: COL.woodD, capA: false });
+  disc(add(cc, [0, 0, 9]), Z, X, Y, 38, 38, 12, { col: [240, 236, 214] });
+  for (let i = 0; i < 12; i += 3) { const a = i / 12 * Math.PI * 2; axisBox([cc[0] + Math.sin(a) * 31, cc[1] + Math.cos(a) * 31, cc[2] + 10], 3.5, 3.5, 1, { col: [30, 24, 30] }); }
+  const hand = (deg, l, th, col, z) => { const a = deg * Math.PI / 180, d = [Math.sin(a), Math.cos(a), 0], pn = [d[1], -d[0], 0]; obox(add(cc, [d[0] * l / 2, d[1] * l / 2, z]), d, pn, Z, l / 2, th, 1, { col }); };
+  hand(356 + t * 0.4, 20, 3.2, [24, 20, 28], 10.5); hand(312 + t * 5, 30, 2.6, [24, 20, 28], 11); hand(t * 200, 33, 1.1, [200, 40, 40], 11.5);
+
+  // picture on the wall
+  axisBox([700, 580, WALLZ + 4], 62, 46, 4, { col: COL.woodD });
+  quad([644, 542, WALLZ + 8.5], [756, 542, WALLZ + 8.5], [756, 618, WALLZ + 8.5], [644, 618, WALLZ + 8.5], Z, { tex: TEX.picture, bias: 20, uv4: [[0, 12], [16, 12], [16, 0], [0, 0]] });
+
+  // desk: top, legs, drawer cabinet, mug
+  const d = LAYOUT.desk, dx = d.x + d.w / 2, dTop = 800 - d.y;
+  axisBox([dx, dTop - 8, 0], d.w / 2, 8, 62, { col: COL.wood, faces: [null, null, { tex: TEX.wood, ru: 3, rv: 1 }, null, null, null] });
+  for (const lx of [d.x + 14, d.x + 150]) for (const lz of [-50, 50]) axisBox([lx, (dTop - 16) / 2, lz], 7, (dTop - 16) / 2, 7, { col: COL.woodD });
+  axisBox([d.x + 290, (dTop - 16) / 2, 0], 70, (dTop - 16) / 2, 56, { col: COL.wood });
+  for (let i = 0; i < 2; i++) { const yy = 120 - i * 62; quad([d.x + 222, yy - 24, 57], [d.x + 358, yy - 24, 57], [d.x + 358, yy + 24, 57], [d.x + 222, yy + 24, 57], Z, { col: COL.woodD }); axisBox([d.x + 290, yy, 59], 14, 3, 2, { col: COL.phone }); }
+  axisBox([d.x + 40, (dTop - 16) / 2, -54], 0.1, 1, 1, { col: COL.woodD });
+  prism([d.x + 372, dTop, 14], [d.x + 372, dTop + 20, 14], 10, 10, { sides: 8, ref: X, col: [210, 210, 220], capA: false });
+
+  // laptop
+  const L = LAYOUT.laptop, lcx = L.base.x + L.base.w / 2, lbase = dTop + 0;
+  axisBox([lcx, lbase + 6, 22], L.base.w / 2, 6, 42, { col: COL.silver });
+  quad([L.base.x + 18, lbase + 12.3, 56], [L.base.x + L.base.w - 18, lbase + 12.3, 56], [L.base.x + L.base.w - 18, lbase + 12.3, -12], [L.base.x + 18, lbase + 12.3, -12], Y, { tex: keyTex(p), uv4: [[0, 16], [32, 16], [32, 0], [0, 0]] });
+  const tilt = 12 * Math.PI / 180, ey = [0, Math.cos(tilt), -Math.sin(tilt)], ez = [0, Math.sin(tilt), Math.cos(tilt)], hinge = [lcx, lbase + 12, -14];
+  const sh = L.screen.h, sw = L.screen.w;
+  obox(comb(hinge, ey, sh / 2), X, ey, ez, sw / 2, sh / 2, 3, { col: COL.silverD });
+  const sp = (sx, sy) => comb(hinge, X, sx, ey, sy, ez, 4.5);
+  quad(sp(-sw / 2 + 8, 8), sp(sw / 2 - 8, 8), sp(sw / 2 - 8, sh - 8), sp(-sw / 2 + 8, sh - 8), ez, { tex: screenTex(st, p), bias: 15, unlit: 1.15 + 0.35 * ship * Math.exp(-Math.max(age, 0) * 6), nofog: false, uv4: [[0, 36], [48, 36], [48, 0], [0, 0]] });
+
+  // plant, in front of the desk
+  const pl = LAYOUT.plant, pc = [pl.x, 0, 120];
+  prism(pc, add(pc, [0, 58, 0]), 28, 38, { sides: 8, ref: X, col: COL.pot, capA: false, capB: false });
+  prism(add(pc, [0, 58, 0]), add(pc, [0, 70, 0]), 42, 42, { sides: 8, ref: X, col: [196, 112, 76], capA: false });
+  disc(add(pc, [0, 68, 0]), Y, X, Z, 36, 36, 8, { col: [40, 28, 24] });
+  const sway = (i) => Math.sin(t * 1.7 + i * 1.3) * 0.05 + (age >= 0 ? 0.16 * Math.exp(-age * 6) * Math.sin(age * 38 + i) : 0);
+  const base = add(pc, [0, 68, 0]);
+  for (let i = 0; i < 9; i++) {
+    const az = i / 9 * Math.PI * 2 + 0.4, el = 0.55 + (i % 3) * 0.28 + sway(i), L1 = 120 + (i % 4) * 28;
+    const dir = [Math.cos(az) * Math.cos(el), Math.sin(el), Math.sin(az) * Math.cos(el)], side = norm(cross(dir, Y));
+    const dir2 = [Math.cos(az) * Math.cos(el - 0.35), Math.sin(el - 0.35), Math.sin(az) * Math.cos(el - 0.35)];
+    const p1 = add(base, mul(dir, L1 * 0.5)), p2 = add(p1, mul(dir2, L1 * 0.5)), w1 = 13;
+    const n = norm(cross(side, dir));
+    const c0 = COL.leafD, c1 = [60, 140, 66], c2 = COL.leafL;
+    emit(add(base, mul(side, 3)), add(base, mul(side, -3)), add(p1, mul(side, -w1)), n, n, n, { cols: [c0, c0, c1], two: true });
+    emit(add(base, mul(side, 3)), add(p1, mul(side, -w1)), add(p1, mul(side, w1)), n, n, n, { cols: [c0, c1, c1], two: true });
+    emit(add(p1, mul(side, w1)), add(p1, mul(side, -w1)), p2, n, n, n, { cols: [c1, c1, c2], two: true });
+  }
+}
+
+function keyTex(p) {
+  const tp = p.tap, key = Math.floor(p.t * 5 + 0.3) % 3;
+  return tex(32, 16, (x, y) => {
+    if (x < 1 || y < 1 || x > 30 || y > 14) return [52, 54, 64];
+    if (y % 3 === 0 || x % 3 === 0) return [40, 42, 52];
+    if (tp > 0.3) { const kx = [8, 15, 22][key], ky = [5, 8, 5][key]; if (Math.abs(x - kx) < 2 && Math.abs(y - ky) < 2) return [255, 250, 140]; }
+    return [112, 116, 134];
+  });
+}
+function screenTex(st, p) {
+  const s = st.screen, ship = s.ship, aw = s.awake;
+  const CC = [[90, 220, 255], [255, 130, 210], [255, 214, 100], [90, 220, 255], [170, 130, 255], [255, 130, 210]];
+  const bg = [lerp(10, 18, aw), lerp(12, 34, aw), lerp(18, 74, aw)];
+  const cv = new Uint8ClampedArray(48 * 36 * 3);
+  const put = (x, y, c) => { if (x < 0 || y < 0 || x >= 48 || y >= 36) return; const i = (y * 48 + x) * 3; cv[i] = c[0]; cv[i + 1] = c[1]; cv[i + 2] = c[2]; };
+  for (let y = 0; y < 36; y++) for (let x = 0; x < 48; x++) put(x, y, (y & 1) ? bg : [bg[0] * 0.9, bg[1] * 0.9, bg[2] * 0.9]);
+  for (let x = 0; x < 48; x++) { put(x, 0, [44, 56, 110]); put(x, 1, [44, 56, 110]); }
+  s.rows.forEach((r, i) => { const n = Math.round(r.w * 40 * r.len), x0 = 3 + Math.round(r.indent * 40); for (let x = 0; x < n; x++) { put(x0 + x, 5 + i * 5, CC[i]); put(x0 + x, 6 + i * 5, CC[i]); } });
+  const out = tex(48, 36, (x, y) => {
+    const i = (y * 48 + x) * 3; let c = [cv[i], cv[i + 1], cv[i + 2]];
+    if (ship > 0) { const g = [lerp(20, 40, (y & 1) * 0.5), 168 - (y & 1) * 10, 78]; c = [lerp(c[0], g[0], ship), lerp(c[1], g[1], ship), lerp(c[2], g[2], ship)]; }
+    return c;
+  });
+  if (ship > 0.4) {
+    const put2 = (x, y, w, h, c) => { for (let yy = y; yy < y + h; yy++) for (let xx = x; xx < x + w; xx++) { if (xx < 0 || yy < 0 || xx >= 48 || yy >= 36) continue; const i = (yy * 48 + xx) * 4; out.d[i] = c[0]; out.d[i + 1] = c[1]; out.d[i + 2] = c[2]; } };
+    for (let i = 0; i < 7; i++) put2(10 + i * 2, 14 + i * 2, 5, 5, [255, 255, 255]);
+    for (let i = 0; i < 13; i++) put2(23 + i * 2, 26 - i * 2, 5, 5, [255, 255, 255]);
+  }
+  return out;
+}
+
+// the character: a stack of boxes and hex prisms, driven by the same joints as every other style
+function buildFigure(t, p, st) {
+  const cel = p.celebrate, sm = Math.max(cel, st.screen.ship);
+  const pel = W3(p.pelvis), nk = W3(p.neck);
+  const a = norm(sub(nk, pel)), f = [a[1], -a[0], 0], al = len(sub(nk, pel));
+  // torso: hoodie with a pocket, a hood and strings
+  obox(comb(pel, a, (al - 14) / 2), f, a, Z, 29, (al + 14) / 2, 30, { col: COL.hood, top: [31 / 29, 28 / 30], faces: [{ col: COL.hoodL }, { col: COL.hoodD }, { col: COL.hoodL }, { col: COL.hoodD }, null, { col: COL.hoodD }] });
+  obox(comb(pel, a, 30, f, 31), f, a, Z, 3, 13, 20, { col: COL.hoodD });
+  obox(comb(nk, a, -6, f, -24), f, a, Z, 12, 13, 22, { col: COL.hoodD });
+  for (const zz of [-8, 8]) obox(comb(pel, a, al - 22, f, 31.5, Z, zz), f, a, Z, 1.2, 11, 1.4, { col: [236, 232, 224] });
+  obox(comb(nk, a, 8), f, a, Z, 9, 9, 9, { col: COL.skin });                 // neck
+  // headphones around the neck: a ring of small boxes plus a cup on the chest
+  for (let i = 0; i < 10; i++) {
+    const q = i / 10 * Math.PI * 2, c = comb(nk, a, 3, f, Math.cos(q) * 26, Z, Math.sin(q) * 24), tg = norm(add(mul(f, -Math.sin(q) * 26), mul(Z, Math.cos(q) * 24)));
+    obox(c, tg, a, cross(tg, a), 9, 3.5, 3.5, { col: COL.phoneD });
+  }
+  for (const zz of [1, -1]) { const c0 = comb(nk, a, -30, f, 18, Z, zz * 29); prism(c0, add(c0, [0, 0, zz * 12]), 13, 13, { sides: 8, ref: X, colA: COL.phoneD, colB: COL.phone, capA: false }); }
+
+  // head, turned toward the camera so the face texture reads, tilted by the rig
+  const hd = p.head, ha = hd.angle, hc = W3(hd), f0 = [Math.cos(ha), -Math.sin(ha), 0], u0 = [Math.sin(ha), Math.cos(ha), 0];
+  const yaw = 0.62 + 0.18 * cel, ex = add(mul(f0, Math.cos(yaw)), mul(Z, Math.sin(yaw))), ez = add(mul(Z, Math.cos(yaw)), mul(f0, -Math.sin(yaw)));
+  const blink = (t > 0.9 && t < 0.96) || (t > 1.9 && t < 1.95) || (t > 2.55 && t < 2.59);
+  const ft = sm > 0.5 ? TEX.faceG : blink ? TEX.faceB : TEX.faceN;
+  const hx = 33, hy = 36, hz = 33;
+  obox(hc, ex, u0, ez, hx, hy, hz, { col: COL.skin, faces: [{ tex: ft, uv4: [[0, 16], [16, 16], [16, 0], [0, 0]] }, { col: COL.hair }, { col: COL.hair }, { col: COL.skinD }, null, null] });
+  obox(comb(hc, u0, hy - 4), ex, u0, ez, hx + 2.5, 8, hz + 2.5, { col: COL.hair, faces: [null, null, { col: COL.hairL }, null, null, null] });
+  obox(comb(hc, ex, -(hx - 6), u0, 4), ex, u0, ez, 8, hy - 6, hz + 2.5, { col: COL.hair });
+  obox(comb(hc, ex, hx - 1, u0, hy - 12), ex, u0, ez, 3, 5, hz, { col: COL.hairL });
+  for (const zz of [1, -1]) {
+    obox(comb(hc, ez, zz * (hz + 3), ex, -2, u0, -3), ex, u0, ez, 4, 7, 2.5, { col: COL.skinD });
+    obox(comb(hc, ez, zz * (hz + 1), ex, -8, u0, 12), ex, u0, ez, 12, 12, 2, { col: COL.hair });
+  }
+  obox(comb(hc, ex, hx + 3, u0, -4), ex, u0, ez, 3, 5, 3.5, { col: COL.skinD });
+
+  // legs
+  const leg = (s) => {
+    const hip = W3(s.hip), kn = W3(s.knee), an = W3(s.ankle), tp = W3(s.toe);
+    obox(hip, X, Y, Z, 14, 10, 13, { col: COL.jeansD });
+    prism(hip, kn, 14, 12.5, { colA: COL.jeans, colB: COL.jeansD, capA: false, capB: false });
+    obox(kn, X, Y, Z, 12.5, 12, 12.5, { col: COL.jeansD });
+    prism(kn, an, 12, 10, { colA: COL.jeansD, colB: COL.jeans, capA: false });
+    const wa = -Math.atan2(s.toe.y - s.ankle.y - 12, s.toe.x - s.ankle.x), fs = [Math.cos(wa), Math.sin(wa), 0], us = [-Math.sin(wa), Math.cos(wa), 0];
+    obox(comb(tp, fs, -22, us, 5), fs, us, Z, 29, 5, 12.5, { col: COL.sole });
+    obox(comb(tp, fs, -28, us, 16), fs, us, Z, 23, 9, 12, { col: COL.shoe });
+    obox(comb(tp, fs, -5, us, 9), fs, us, Z, 9, 5, 12, { col: [210, 210, 222] });
+    obox(comb(tp, fs, -47, us, 14), fs, us, Z, 3, 8, 12.4, { col: COL.red });
+  };
+  leg(p.far); leg(p.near);
+  // arms
+  const arm = (s) => {
+    const sh = W3(s.shoulder), el = W3(s.elbow), hn = W3(s.hand), d = norm(sub(hn, el));
+    obox(sh, X, Y, Z, 11, 11, 11, { col: COL.hood });
+    prism(sh, el, 10.5, 9, { colA: COL.hood, colB: COL.hoodD, capA: false, capB: false });
+    obox(el, X, Y, Z, 9.5, 9.5, 9.5, { col: COL.hoodD });
+    prism(el, sub(hn, mul(d, 6)), 9, 8.5, { colA: COL.hood, colB: COL.hoodD, capA: false });
+    const hs = cel > 0.5 && s === p.near ? 9.5 : 8;
+    obox(add(hn, mul(d, 6)), X, Y, Z, hs, hs, hs, { col: COL.skin });
+  };
+  arm(p.far); arm(p.near);
+}
+
+function buildConfetti(t) {
+  const C4 = [[230, 60, 70], [242, 212, 60], [70, 210, 232], [130, 232, 84]];
+  for (const q of particles(t)) {
+    const s = q.size * 1.9 * (0.35 + 0.65 * q.alpha), c = [q.x, 800 - q.y, -10 + (q.i * 37) % 70];
+    const ax = [Math.cos(q.rot), Math.sin(q.rot), 0], ay = [-Math.sin(q.rot) * Math.cos(q.rot * 1.3), Math.cos(q.rot) * Math.cos(q.rot * 1.3), Math.sin(q.rot * 1.3)];
+    const n = norm(cross(ax, ay));
+    quad(comb(c, ax, -s / 2, ay, -s * 0.35), comb(c, ax, s / 2, ay, -s * 0.35), comb(c, ax, s / 2, ay, s * 0.35), comb(c, ax, -s / 2, ay, s * 0.35), n, { col: C4[q.kind], two: true, unlit: 1.0 + 0.4 * Math.abs(n[2]), nofog: true });
+  }
+}
+
+// ---- 2d overlays drawn straight into the frame buffer ----------------------------------------------------------------------
+function overlay(fb, st, t) {
+  const age = st.shipAge;
+  if (age < 0) return;
+  const put = (x, y, w, h, c) => { for (let yy = Math.max(0, y); yy < Math.min(R, y + h); yy++) for (let xx = Math.max(0, x); xx < Math.min(R, x + w); xx++) { const i = (yy * R + xx) * 4; fb[i] = c[0]; fb[i + 1] = c[1]; fb[i + 2] = c[2]; } };
+  const GREEN = [150, 255, 96], DARKG = [8, 32, 20];
+  const slide = Math.round((1 - smooth(0, 0.16, age)) * -34), show = age > 0.14 || Math.floor(age * 40) % 2 === 0;
+  if (show) {
+    const y0 = 8 + Math.round(slide / 2), x0 = 33;
+    put(x0, y0, 94, 24, [10, 14, 12]); put(x0, y0, 94, 1, GREEN); put(x0, y0 + 23, 94, 1, GREEN); put(x0, y0, 1, 24, GREEN); put(x0 + 93, y0, 1, 24, GREEN);
+    drawText(put, 'SHIPPED', x0 + 6 + 1, y0 + 5 + 1, 2, DARKG);
+    drawText(put, 'SHIPPED', x0 + 6, y0 + 5, 2, GREEN);
+  }
+  if (age > 0.1) {
+    // memory card icon with a blinking LED, and SAVING...
+    const bx = 141, by = 134, ph = Math.floor((age - 0.1) * 9);
+    put(bx - 1, by - 1, 16, 21, [10, 10, 16]);
+    put(bx, by, 14, 19, [150, 156, 176]); put(bx + 9, by, 5, 4, [10, 10, 16]);
+    put(bx + 2, by + 5, 10, 7, [56, 66, 150]); put(bx + 4, by + 7, 6, 1, [200, 210, 255]); put(bx + 4, by + 9, 4, 1, [200, 210, 255]);
+    for (let i = 0; i < 4; i++) put(bx + 2 + i * 3, by + 14, 2, 4, [226, 184, 64]);
+    put(bx + 11, by + 6, 2, 2, ph % 2 ? [120, 255, 120] : [20, 70, 30]);
+    const dots = '.'.repeat(1 + (ph % 3));
+    put(83, 143, 56, 9, [10, 10, 16]);
+    drawText(put, 'SAVING', 85, 144, 1, [236, 240, 230]);
+    drawText(put, dots, 85 + 36, 144, 1, [236, 240, 230]);
+  }
+}
+
+// ---- render ----------------------------------------------------------------------------------------------------------------------
+export function render(ctx, t, w, h) {
+  fbInit();
+  const st = story(t), p = pose(t), age = st.shipAge, ship = st.screen.ship;
+  const fb = FB.img.data, zb = FB.z;
+  for (let i = 0; i < R * R; i++) { fb[i * 4] = FOG[0]; fb[i * 4 + 1] = FOG[1]; fb[i * 4 + 2] = FOG[2]; fb[i * 4 + 3] = 255; zb[i] = 1e9; }
+
+  const pulse = age >= 0 ? Math.exp(-age * 6) : 0, L = LAYOUT.laptop.screen;
+  LIGHTS = [
+    { p: [480, 735, 140], c: [1.0, 0.78, 0.5], r: 1500, k: 0.82 },                                                      // ceiling lamp, off centre
+    { p: [210, 520, -130], c: [0.25, 0.4, 0.95], r: 760, k: 0.9 },                                                      // moon through the window
+    { p: [L.x + L.w / 2, 800 - L.y - L.h / 2, 60], c: mixc([0.15, 0.55, 0.8], [0.25, 0.95, 0.2], ship), r: 560, k: (0.2 + 0.8 * st.screen.awake) * (1 + 0.9 * pulse) * 0.85 },  // laptop screen
+  ];
+  TR = [];
+  buildRoom(t, st, p);
+  buildFigure(t, p, st);
+  buildConfetti(t);
+
+  // transform, light and fog every vertex, then fill
+  for (const tr of TR) {
+    const o = tr.o, A = project(tr.p[0], tr.n[0], o, 0), B = project(tr.p[1], tr.n[1], o, 1), C = project(tr.p[2], tr.n[2], o, 2);
+    if (A.z < 20 || B.z < 20 || C.z < 20) continue;
+    if ((A.x < 0 && B.x < 0 && C.x < 0) || (A.y < 0 && B.y < 0 && C.y < 0) || (A.x >= R && B.x >= R && C.x >= R) || (A.y >= R && B.y >= R && C.y >= R)) continue;
+    rasterTri(fb, zb, A, B, C, o.tex || null);
+  }
+  // blob shadows multiply what is already on the floor
+  const blob = (cx, cz, rx, rz, k) => {
+    const pts = []; for (let i = 0; i < 10; i++) { const a = i / 10 * Math.PI * 2; pts.push(project([cx + Math.cos(a) * rx, 2.6, cz + Math.sin(a) * rz], Y, { col: [0, 0, 0], nofog: true, unlit: 1 }, 0)); }
+    const c0 = project([cx, 2.6, cz], Y, { col: [0, 0, 0], nofog: true, unlit: 1 }, 0);
+    for (let i = 0; i < 10; i++) rasterTri(fb, zb, c0, pts[i], pts[(i + 1) % 10], null, k);
+  };
+  blob(p.pelvis.x + 6, 0, 52 * (1 - p.hop / 120), 30, 0.5);
+  blob(LAYOUT.plant.x, 120, 52, 52, 0.55);
+  blob(LAYOUT.desk.x + 200, 0, 200, 70, 0.7);
+
+  overlay(fb, st, t);
+
+  // 5-bit colour with a 4x4 ordered dither
+  for (let y = 0; y < R; y++) for (let x = 0; x < R; x++) {
+    const i = (y * R + x) * 4, off = (BAYER[(y & 3) * 4 + (x & 3)] / 15 - 0.5) * 8;
+    for (let c = 0; c < 3; c++) { const q = Math.max(0, Math.min(31, Math.floor((fb[i + c] + off) / 8))); fb[i + c] = (q << 3) | (q >> 2); }
+  }
+  FB.ctx.putImageData(FB.img, 0, 0);
+  ctx.save();
+  ctx.imageSmoothingEnabled = false;
+  ctx.globalAlpha = 1; ctx.globalCompositeOperation = 'source-over';
+  ctx.drawImage(FB.cv, 0, 0, R, R, 0, 0, w, h);
+  ctx.restore();
+}
+
+function mixc(a, b, k) { return [a[0] + (b[0] - a[0]) * k, a[1] + (b[1] - a[1]) * k, a[2] + (b[2] - a[2]) * k]; }
