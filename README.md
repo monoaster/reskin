@@ -9,7 +9,7 @@ isometric voxels, PS1 low-poly, boiling ink, ASCII, clay.
 Each style is one JavaScript file that Claude wrote from the prompt sitting next to it. The prompts are the point:
 read one, paste it, get a different skin.
 
-**[Open the gallery](gallery.html)** (all ten, playing in step) or open any file in `examples/` on its own.
+Clone it, then open `gallery.html` (all ten, playing in step) or any file in `examples/` on its own.
 No build step, no dependencies, no network.
 
 <!-- styles:start -->
